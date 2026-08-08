@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "patreon-archive"
+version = "0.1.0"
+description = "Download video from Patreon posts you are entitled to view."
+requires-python = ">=3.12"
+dependencies = [
+    "yt-dlp==2026.7.4",
+    "curl_cffi==0.16.0",
+]
+
+[project.scripts]
+patreon-archive = "patreon_archive.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/patreon_archive"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/patreon_archive/state/schema.sql" = "patreon_archive/state/schema.sql"

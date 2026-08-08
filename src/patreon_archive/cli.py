@@ -1,0 +1,502 @@
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import dataclasses
+import queue
+import re
+import sys
+import threading
+from pathlib import Path
+
+import yt_dlp
+
+from . import __version__
+from .api.client import PatreonApi, post_url
+from .auth import preflight
+from .auth.cookies import materialized_jar
+from .config import Config, DEFAULT_OUTTMPL, OUTTMPL_WITH_ID, parse_browser_spec
+from .errors import Outcome, PatreonArchiveError
+from .events import Emitter, ev, set_emitter
+from .media import ytdlp_runner
+from .media.progress import MultilineProgress
+from .selection import parse_items
+from .state.store import Store
+
+_COLLECTION_URL = re.compile(r"patreon\.com/collection/(\d+)", re.I)
+# Both canonical forms: /posts/<id> and /<creator>/posts/<slug>-<id>
+_POST_ID = re.compile(r"/posts/(?:.*?-)?(\d+)/?(?:[?#]|$)", re.I)
+
+
+def extract_post_id(url: str) -> str | None:
+    m = _POST_ID.search(url)
+    return m.group(1) if m else None
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_NO_ACCESS = 2
+EXIT_INDETERMINATE = 3
+EXIT_PREFLIGHT = 4
+
+_EXIT = {
+    Outcome.COMPLETE: EXIT_OK,
+    Outcome.FAILED: EXIT_FAILED,
+    Outcome.NO_ACCESS: EXIT_NO_ACCESS,
+    Outcome.INDETERMINATE: EXIT_INDETERMINATE,
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="patreon-archive",
+        description="Download video from Patreon posts you are entitled to view.",
+    )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.epilog = (
+        "Any arguments after a bare '--' are passed straight to yt-dlp, e.g.\n"
+        "  patreon-archive get URL -- -f 'best[height<=720]' --write-comments\n"
+        "Only flags you actually pass are applied; yt-dlp defaults do not override ours."
+    )
+    p.formatter_class = argparse.RawDescriptionHelpFormatter
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-b", "--browser", default="firefox",
+                        help="cookie source, e.g. firefox, 'chrome:Profile 1' (default: firefox)")
+    common.add_argument("--cookies-file", help="Netscape cookies.txt instead of a browser")
+    common.add_argument("-o", "--output-dir", default="downloads", type=Path)
+    common.add_argument("--temp-dir", type=Path, default=None)
+    common.add_argument("--state-db", type=Path, default=None,
+                        help="default: <output-dir>/.patreon-archive.db")
+    common.add_argument("--outtmpl", default=None,
+                        help="yt-dlp output template (overrides --keep-id)")
+    common.add_argument("--keep-id", action="store_true",
+                        help="append [post_id] to filenames; recommended for bulk runs, "
+                             "since two posts can share a title")
+    common.add_argument("-f", "--format", dest="fmt", default="bestvideo*+bestaudio/best")
+    common.add_argument("--ffmpeg-location", default=None)
+    common.add_argument("--concurrent-fragments", type=int, default=4,
+                        help="native HLS only; silently ignored when yt-dlp delegates to ffmpeg")
+    common.add_argument("--request-sleep", type=float, default=0.0)
+    common.add_argument("--no-thumbnails", action="store_true")
+    common.add_argument("--no-infojson", action="store_true")
+    common.add_argument("--no-subs", action="store_true")
+    common.add_argument("-q", "--quiet", action="store_true")
+    common.add_argument("--agent", action="store_true",
+                        help="machine-readable JSONL events on stdout (one object per "
+                             "line, flushed immediately) for running as a background "
+                             "task. Human text goes to stderr; stdout stays a clean "
+                             "data channel. Implies --quiet for yt-dlp's own output")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    g = sub.add_parser("get", parents=[common],
+                       help="download a post URL, or every post in a collection URL")
+    g.add_argument("url")
+    g.add_argument("--force", action="store_true", help="re-download even if state says complete")
+    g.add_argument("-n", "--dry-run", action="store_true", help="resolve only, download nothing")
+    g.add_argument("--limit", type=int, default=None, help="stop after N posts (collections)")
+    g.add_argument("-I", "--items", default=None, metavar="SPEC",
+                   help="which collection entries to fetch, 1-based: '1-5', '3,7,9', "
+                        "'2-', '-3' (third from last), '1-3,-2-'")
+    g.add_argument("-j", "--concurrency", type=int, default=1, metavar="N",
+                   help="download N posts at once (collections); each gets its own "
+                        "progress row. Default 1 = yt-dlp's normal single-line progress")
+    g.add_argument("--list", action="store_true",
+                   help="list collection entries with their numbers, download nothing")
+    g.add_argument("--continue-on-error", action="store_true", default=True,
+                   help="keep going when one post fails (default)")
+    g.add_argument("--stop-on-error", dest="continue_on_error", action="store_false")
+
+    sub.add_parser("auth", parents=[common], help="check cookies and environment")
+
+    s = sub.add_parser("status", parents=[common], help="show archive state")
+    s.add_argument("--post", help="show detail for one post id")
+
+    sub.add_parser("help", help="print full help for every command")
+    return p
+
+
+def cmd_help() -> int:
+    """One page covering every command, rather than --help per subcommand."""
+    p = build_parser()
+    p.print_help()
+    subs = [a for a in p._actions if isinstance(a, argparse._SubParsersAction)]
+    for action in subs:
+        for name, parser in action.choices.items():
+            if name == "help":
+                continue
+            print("\n" + "=" * 72)
+            print(f"COMMAND: {name}")
+            print("=" * 72)
+            parser.print_help()
+    print("\n" + "=" * 72)
+    print("AGENT MODE (--agent)")
+    print("=" * 72)
+    print("""
+Emits one JSON object per line on stdout, flushed immediately. Human text is
+diverted to stderr so stdout stays a clean data channel. Run it backgrounded and
+tail stdout.
+
+  run_start          kind, collection_id, title, total, selected, concurrency, post_ids
+  collection_listed  entries[] of {index, post_id, url}   (with --list)
+  post_start         index, post_id, url
+  progress           index, post_id, percent, downloaded_bytes, total_bytes,
+                     speed_bps, eta_s, fragment, fragment_count   (throttled ~2s)
+  post_downloaded    index, post_id, note=muxing
+  post_done          index, post_id, outcome, title, path, bytes, detail
+  run_done           summary{outcome: count}, selected, exit_code
+
+Exit codes: 0 complete, 1 failed, 2 no_access, 3 indeterminate, 4 preflight error.
+
+Example:
+  patreon-archive get URL -I 1-5 -j 3 --agent > events.jsonl 2> run.log &
+""")
+    return EXIT_OK
+
+
+def _config(a: argparse.Namespace) -> Config:
+    out = a.output_dir.expanduser().resolve()
+    return Config(
+        archive_root=out,
+        temp_dir=(a.temp_dir or out / ".tmp").expanduser().resolve(),
+        state_db=(a.state_db or out / ".patreon-archive.db").expanduser().resolve(),
+        browser_spec=None if a.cookies_file else parse_browser_spec(a.browser),
+        cookie_file=a.cookies_file,
+        outtmpl=a.outtmpl or (OUTTMPL_WITH_ID if a.keep_id else DEFAULT_OUTTMPL),
+        fmt=a.fmt,
+        ffmpeg_location=a.ffmpeg_location,
+        frag_concurrency=a.concurrent_fragments,
+        request_sleep=a.request_sleep,
+        write_thumbnails=not a.no_thumbnails,
+        write_infojson=not a.no_infojson,
+        write_subs=not a.no_subs,
+        quiet=a.quiet,
+        force=getattr(a, "force", False),
+        concurrency=max(1, getattr(a, "concurrency", 1)),
+        agent=getattr(a, "agent", False),
+        extra_ytdlp=ytdlp_runner.parse_passthrough(getattr(a, "ytdlp_args", []) or []),
+    )
+
+
+def cmd_auth(cfg: Config) -> int:
+    pf = preflight.check(cfg)
+    print(f"ffmpeg          {pf.ffmpeg}")
+    print(f"yt-dlp          {ytdlp_runner.YTDLP_VERSION}")
+    print(f"cookies loaded  {pf.cookie_count}")
+    print(f"session_id      {'present' if pf.has_session else 'MISSING'}")
+    print(f"device_id       {'present' if pf.has_device_id else 'absent'}")
+    for w in pf.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    return EXIT_OK
+
+
+_MEDIA_STATE = {
+    Outcome.COMPLETE: "complete",
+    Outcome.NO_ACCESS: "skipped_no_access",
+    Outcome.INDETERMINATE: "indeterminate",
+    Outcome.FAILED: "failed",
+}
+
+
+def _persist(store: Store, res, pid: str, url: str, dry_run: bool) -> None:
+    if dry_run:
+        return
+    store.upsert_post(
+        post_id=pid,
+        outcome=res.outcome,
+        tool_version=__version__,
+        ytdlp_version=ytdlp_runner.YTDLP_VERSION,
+        title=res.title,
+        post_url=url,
+        can_view=0 if res.outcome == Outcome.NO_ACCESS else 1,
+        media_expected=1,
+        media_obtained=1 if res.outcome == Outcome.COMPLETE else 0,
+        outcome_detail=res.detail,
+    )
+    store.record_media(
+        post_id=pid,
+        source_kind="ytdlp_post_url",
+        state=_MEDIA_STATE[res.outcome],
+        output_path=str(res.filepath) if res.filepath else None,
+        detail=res.detail,
+    )
+
+
+def _one_post(cfg: Config, store: Store, url: str, dry_run: bool) -> Outcome:
+    """Download a single post URL and record its outcome. Never raises."""
+    post_id = extract_post_id(url)
+    if post_id:
+        proceed, why = store.should_process(
+            post_id, force=cfg.force, tool_version=__version__
+        )
+        if not proceed:
+            ev().emit("post_skipped", post_id=post_id, reason=why)
+            _out(f"skip {post_id}: {why}", cfg)
+            return Outcome.COMPLETE
+
+    ev().emit("post_start", post_id=post_id, url=url)
+    res = ytdlp_runner.download(
+        url, cfg,
+        simulate=dry_run,
+        hooks=[ev().hook(0, post_id or url)] if cfg.agent else None,
+    )
+    pid = res.post_id or post_id or url
+
+    if dry_run:
+        ev().emit("post_would_download", post_id=pid, title=res.title)
+        _out(f"would download: {res.title or '?'}  [{pid}]", cfg)
+        return res.outcome
+
+    _persist(store, res, pid, url, dry_run)
+
+    ev().emit(
+        "post_done", post_id=pid, outcome=str(res.outcome), title=res.title,
+        path=str(res.filepath) if res.filepath else None,
+        bytes=res.filepath.stat().st_size if (res.filepath and res.filepath.exists()) else None,
+        detail=res.detail,
+    )
+    if res.outcome == Outcome.COMPLETE and res.filepath:
+        mb = res.filepath.stat().st_size / (1024 * 1024)
+        _out(f"  ok  {res.filepath.name}  ({mb:.1f} MiB)", cfg)
+    elif res.outcome == Outcome.NO_ACCESS:
+        _out(f"  no access  [{pid}] {res.detail}", cfg, err=True)
+    elif res.outcome == Outcome.INDETERMINATE:
+        _out(f"  indeterminate  [{pid}] {res.detail} (will retry on re-run)", cfg, err=True)
+    else:
+        _out(f"  failed  [{pid}] {res.detail}", cfg, err=True)
+    return res.outcome
+
+
+def cmd_get(cfg: Config, a: argparse.Namespace) -> int:
+    pf = preflight.check(cfg)
+    for w in pf.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    # preflight may have switched to a profile that actually has a session
+    cfg = dataclasses.replace(cfg, browser_spec=pf.browser_spec)
+
+    cfg.archive_root.mkdir(parents=True, exist_ok=True)
+    cfg.temp_dir.mkdir(parents=True, exist_ok=True)
+
+    m = _COLLECTION_URL.search(a.url)
+
+    # Extract browser cookies once, not once per post.
+    with materialized_jar(cfg.browser_spec, cfg.cookie_file) as jar_file:
+        if jar_file and jar_file != cfg.cookie_file:
+            cfg = dataclasses.replace(cfg, browser_spec=None, cookie_file=jar_file)
+
+        if m:
+            return _collection(cfg, a, m.group(1))
+
+        store = Store(cfg.state_db)
+        try:
+            return _EXIT[_one_post(cfg, store, a.url, a.dry_run)]
+        finally:
+            store.close()
+
+
+def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
+    """Collections are unsupported by yt-dlp, so we enumerate them ourselves."""
+    params = {"quiet": True, "no_warnings": True}
+    if cfg.browser_spec:
+        params["cookiesfrombrowser"] = cfg.browser_spec
+    if cfg.cookie_file:
+        params["cookiefile"] = cfg.cookie_file
+
+    with yt_dlp.YoutubeDL(params) as ydl:
+        api = PatreonApi(ydl, request_sleep=cfg.request_sleep)
+        coll = api.collection(collection_id)
+
+    label = coll.title or f"collection {collection_id}"
+    total = len(coll.post_ids)
+
+    if a.list:
+        ev().emit("collection_listed", collection_id=collection_id, title=label,
+                  total=total,
+                  entries=[{"index": n, "post_id": p, "url": post_url(p)}
+                           for n, p in enumerate(coll.post_ids, 1)])
+        _out(f"{label}: {total} posts", cfg)
+        for n, pid in enumerate(coll.post_ids, 1):
+            _out(f"  {n:3}  {pid}  {post_url(pid)}", cfg)
+        return EXIT_OK
+
+    picked = parse_items(a.items, total) if a.items else list(range(1, total + 1))
+    if a.limit:
+        picked = picked[: a.limit]
+    chosen = [(n, coll.post_ids[n - 1]) for n in picked]
+
+    ev().emit("run_start", kind="collection", collection_id=collection_id,
+              title=label, total=total, selected=len(chosen),
+              concurrency=cfg.concurrency, dry_run=a.dry_run,
+              post_ids=[pid for _, pid in chosen])
+    _out(f"{label}: {total} posts, selected {len(chosen)}"
+         f"{f', {cfg.concurrency} at a time' if cfg.concurrency > 1 else ''}\n", cfg)
+
+    tally: dict[Outcome, int] = {}
+    store = Store(cfg.state_db)
+    lock = threading.Lock()
+
+    def record(outcome: Outcome) -> None:
+        with lock:
+            tally[outcome] = tally.get(outcome, 0) + 1
+
+    try:
+        if cfg.concurrency > 1:
+            _parallel(cfg, store, chosen, a, record)
+        else:
+            for n, pid in chosen:
+                _out(f"[{n}/{total}] post {pid}", cfg)
+                try:
+                    outcome = _one_post(cfg, store, post_url(pid), a.dry_run)
+                except KeyboardInterrupt:
+                    print("\ninterrupted", file=sys.stderr)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    outcome = Outcome.FAILED
+                    print(f"  failed  [{pid}] {type(exc).__name__}: {exc}", file=sys.stderr)
+                record(outcome)
+                if outcome != Outcome.COMPLETE and not a.continue_on_error:
+                    break
+    finally:
+        store.close()
+
+    code = EXIT_OK
+    if tally.get(Outcome.FAILED):
+        code = EXIT_FAILED
+    elif tally.get(Outcome.INDETERMINATE):
+        code = EXIT_INDETERMINATE
+
+    ev().emit("run_done", summary={str(k): v for k, v in tally.items()},
+              selected=len(chosen), exit_code=code)
+    _out("\nsummary", cfg)
+    for oc in (Outcome.COMPLETE, Outcome.NO_ACCESS, Outcome.INDETERMINATE, Outcome.FAILED):
+        if tally.get(oc):
+            _out(f"  {oc:16} {tally[oc]}", cfg)
+    return code
+
+
+
+def _parallel(cfg: Config, store: Store, chosen, a, record) -> None:
+    """Run N posts at once, each owning one live progress row.
+
+    Store writes are serialised: sqlite3 connections are not thread-safe.
+    """
+    slots = min(cfg.concurrency, len(chosen))
+    free: queue.Queue[int] = queue.Queue()
+    for i in range(slots):
+        free.put(i)
+    store_lock = threading.Lock()
+
+    with MultilineProgress(slots) as ui:
+        def work(n: int, pid: str) -> Outcome:
+            slot = free.get()
+            label = f"[{n}] {pid}"
+            try:
+                ui.set(slot, f"  {label:38.38} starting…")
+                ev().emit("post_start", index=n, post_id=pid, url=post_url(pid))
+                hooks = [ui.hook(slot, label)]
+                if cfg.agent:
+                    hooks.append(ev().hook(n, pid))
+                res = ytdlp_runner.download(
+                    post_url(pid), cfg, simulate=a.dry_run, hooks=hooks,
+                )
+                with store_lock:
+                    _persist(store, res, pid, post_url(pid), a.dry_run)
+                ev().emit(
+                    "post_done", index=n, post_id=pid, outcome=str(res.outcome),
+                    title=res.title,
+                    path=str(res.filepath) if res.filepath else None,
+                    bytes=res.filepath.stat().st_size
+                    if (res.filepath and res.filepath.exists()) else None,
+                    detail=res.detail,
+                )
+                if res.outcome == Outcome.COMPLETE and res.filepath:
+                    mb = res.filepath.stat().st_size / (1024 * 1024)
+                    ui.log(f"  ok  [{n}] {res.filepath.name}  ({mb:.1f} MiB)")
+                elif a.dry_run:
+                    ui.log(f"  would download  [{n}] {res.title or pid}")
+                else:
+                    ui.log(f"  {res.outcome}  [{n}] {res.detail}")
+                return res.outcome
+            finally:
+                ui.set(slot, "")
+                free.put(slot)
+
+        with cf.ThreadPoolExecutor(max_workers=slots) as pool:
+            futures = {pool.submit(work, n, pid): (n, pid) for n, pid in chosen}
+            try:
+                for fut in cf.as_completed(futures):
+                    n, pid = futures[fut]
+                    try:
+                        record(fut.result())
+                    except Exception as exc:  # noqa: BLE001
+                        record(Outcome.FAILED)
+                        ui.log(f"  failed  [{n}] {type(exc).__name__}: {exc}")
+            except KeyboardInterrupt:
+                # Let in-flight muxes finish rather than corrupting outputs.
+                ui.log("interrupted; letting in-flight downloads finish…")
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise
+
+
+def cmd_status(cfg: Config, post: str | None) -> int:
+    store = Store(cfg.state_db)
+    try:
+        if post:
+            row = store.get_post(post)
+            if not row:
+                print(f"no record for {post}")
+                return EXIT_FAILED
+            for k in row.keys():
+                print(f"{k:16} {row[k]}")
+            print("\nmedia:")
+            for m in store.media_for(post):
+                print(f"  {m['source_kind']:16} {m['state']:18} {m['output_path'] or '-'}")
+            return EXIT_OK
+        rows = store.summary()
+        if not rows:
+            print("no posts recorded yet")
+        for r in rows:
+            print(f"{r['outcome']:16} {r['n']}")
+        return EXIT_OK
+    finally:
+        store.close()
+
+
+def _out(msg: str, cfg: Config, *, err: bool = False) -> None:
+    """Human text. In agent mode it all goes to stderr so stdout stays JSONL."""
+    print(msg, file=sys.stderr if (err or cfg.agent) else sys.stdout)
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # Everything after a bare '--' belongs to yt-dlp, not us.
+    ytdlp_args: list[str] = []
+    if "--" in raw:
+        i = raw.index("--")
+        raw, ytdlp_args = raw[:i], raw[i + 1:]
+
+    if raw and raw[0] == "help":
+        return cmd_help()
+
+    a = build_parser().parse_args(raw)
+    a.ytdlp_args = ytdlp_args
+    cfg = _config(a)
+    set_emitter(Emitter(cfg.agent))
+    try:
+        if a.cmd == "auth":
+            return cmd_auth(cfg)
+        if a.cmd == "get":
+            return cmd_get(cfg, a)
+        if a.cmd == "status":
+            return cmd_status(cfg, a.post)
+    except PatreonArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_PREFLIGHT
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return EXIT_FAILED
+    return EXIT_FAILED
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
