@@ -32,6 +32,10 @@ def extract_post_id(url: str) -> str | None:
     m = _POST_ID.search(url)
     return m.group(1) if m else None
 
+
+def _looks_like_url(arg: str) -> str | bool:
+    return arg.startswith(("http://", "https://", "www.patreon.com", "patreon.com"))
+
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_NO_ACCESS = 2
@@ -512,6 +516,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if raw and raw[0] == "help":
         return cmd_help()
+
+    # A bare URL means `get`, so the common case is `patreon-archive <url>`.
+    if raw and _looks_like_url(raw[0]):
+        raw.insert(0, "get")
 
     a = build_parser().parse_args(raw)
     a.ytdlp_args = ytdlp_args
