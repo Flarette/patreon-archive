@@ -33,11 +33,22 @@ sleep 2
 say "Installing patreon-archive"
 # curl_cffi is deliberately not installed: it needs a native build that usually
 # fails here, and only the Vimeo fallback uses it. Native Patreon HLS is fine.
-if [ -f "$(dirname "$0")/../pyproject.toml" ]; then
-    pip install "$(dirname "$0")/.."
+HERE="$(cd "$(dirname "$0")" && pwd)"
+WHEEL="$(ls "$HERE"/patreon_archive-*.whl 2>/dev/null | head -1 || true)"
+if [ -n "$WHEEL" ]; then
+    echo "installing bundled wheel: $(basename "$WHEEL")"
+    pip install --upgrade "$WHEEL"
+elif [ -f "$HERE/../pyproject.toml" ]; then
+    pip install --upgrade "$HERE/.."
 else
-    pip install patreon-archive
+    echo "No wheel found next to this script and no source tree above it." >&2
+    echo "Unzip the full archive and run the script from inside it." >&2
+    exit 1
 fi
+
+say "Verifying"
+patreon-archive --version
+echo "installed at: $(command -v patreon-archive)"
 
 say "Checking ffmpeg"
 ffmpeg -version | head -1
