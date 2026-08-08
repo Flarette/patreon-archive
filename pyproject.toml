@@ -9,8 +9,16 @@ description = "Download video from Patreon posts you are entitled to view."
 requires-python = ">=3.12"
 dependencies = [
     "yt-dlp==2026.7.4",
-    "curl_cffi==0.16.0",
+    # Not optional. Without a CA bundle, stock python.org builds on macOS fail
+    # TLS verification outright; yt-dlp picks certifi up automatically when present.
+    "certifi",
 ]
+
+[project.optional-dependencies]
+# curl_cffi needs a native build and generally will not compile under Termux.
+# It is only used for the Vimeo embed fallback; native Patreon HLS does not
+# touch it, so it stays optional and the CLI degrades with a warning.
+vimeo = ["curl_cffi==0.16.0"]
 
 [project.scripts]
 patreon-archive = "patreon_archive.cli:main"

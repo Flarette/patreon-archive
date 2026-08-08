@@ -112,8 +112,43 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status", parents=[common], help="show archive state")
     s.add_argument("--post", help="show detail for one post id")
 
+    c = sub.add_parser("cookies", parents=[common],
+                       help="export browser cookies to a portable cookies.txt")
+    c.add_argument("out", type=Path, nargs="?", default=Path("patreon-cookies.txt"),
+                   help="destination file (default: patreon-cookies.txt)")
+
     sub.add_parser("help", help="print full help for every command")
     return p
+
+
+def cmd_cookies(cfg: Config, out: Path) -> int:
+    """Write a Netscape cookies.txt for use on a machine with no browser profile.
+
+    This is how the tool runs on Android/Termux: browser cookie DBs there live in
+    app-private storage and cannot be read without root, so the session has to be
+    exported from a desktop and carried over.
+    """
+    pf = preflight.check(cfg)
+    for w in pf.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+
+    with materialized_jar(pf.browser_spec, cfg.cookie_file) as jar_file:
+        if not jar_file:
+            raise PatreonArchiveError("nothing to export")
+        data = Path(jar_file).read_bytes()
+
+    out = out.expanduser()
+    out.write_bytes(data)
+    out.chmod(0o600)
+
+    kept = sum(1 for line in data.decode("utf-8", "replace").splitlines()
+               if line.strip() and not line.startswith("#"))
+    print(f"wrote {out}  ({kept} cookies, mode 0600)")
+    print("\nThis file is a live credential. Treat it like a password:")
+    print("  - transfer it privately (scp/USB), not via cloud sync or chat")
+    print("  - it stops working when the Patreon session expires; re-export then")
+    print(f"\nOn the tablet:\n  patreon-archive get --cookies-file {out.name} -o ~/storage/movies '<url>'")
+    return EXIT_OK
 
 
 def cmd_help() -> int:
@@ -489,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_get(cfg, a)
         if a.cmd == "status":
             return cmd_status(cfg, a.post)
+        if a.cmd == "cookies":
+            return cmd_cookies(cfg, a.out)
     except PatreonArchiveError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_PREFLIGHT

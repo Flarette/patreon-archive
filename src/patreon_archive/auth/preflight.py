@@ -123,6 +123,17 @@ def check(cfg: Config) -> Preflight:
     if "__cf_bm" not in names:
         warnings.append("'__cf_bm' cookie absent; if requests are challenged, reload patreon.com in the browser.")
 
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        # Optional: only the Vimeo embed fallback needs it. Native Patreon HLS
+        # does not, so this is a warning rather than a failure -- which is what
+        # makes the tool installable under Termux.
+        warnings.append(
+            "curl_cffi not installed; Vimeo embeds may fail. "
+            "Native Patreon video is unaffected. Install with: pip install 'patreon-archive[vimeo]'"
+        )
+
     return Preflight(
         ffmpeg=ffmpeg,
         cookie_count=total,
