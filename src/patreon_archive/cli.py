@@ -23,7 +23,8 @@ from .media.progress import MultilineProgress
 from .selection import parse_items
 from .state.store import Store
 
-_COLLECTION_URL = re.compile(r"patreon\.com/collection/(\d+)", re.I)
+# Both /collection/<id> and the newer /c/<creator>/collection/<id>.
+_COLLECTION_URL = re.compile(r"patreon\.com/(?:c/[^/?#]+/)?collection/(\d+)", re.I)
 # Both canonical forms: /posts/<id> and /<creator>/posts/<slug>-<id>
 _POST_ID = re.compile(r"/posts/(?:.*?-)?(\d+)/?(?:[?#]|$)", re.I)
 
@@ -273,9 +274,13 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool) -> Outcome:
             _out(f"skip {post_id}: {why}", cfg)
             return Outcome.COMPLETE
 
-    ev().emit("post_start", post_id=post_id, url=url)
+    # Hand yt-dlp the canonical URL. Share links and tracking params ride along
+    # otherwise, and extractor URL matching is sensitive to them.
+    target = post_url(post_id) if post_id else url
+
+    ev().emit("post_start", post_id=post_id, url=target)
     res = ytdlp_runner.download(
-        url, cfg,
+        target, cfg,
         simulate=dry_run,
         hooks=[ev().hook(0, post_id or url)] if cfg.agent else None,
     )
