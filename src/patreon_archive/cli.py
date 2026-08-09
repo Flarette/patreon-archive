@@ -108,6 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "progress row. Default 1 = yt-dlp's normal single-line progress")
     g.add_argument("--list", action="store_true",
                    help="list collection entries with their numbers, download nothing")
+    g.add_argument("-y", "--yes", action="store_true",
+                   help="skip the confirmation before a full-collection download")
     g.add_argument("--continue-on-error", action="store_true", default=True,
                    help="keep going when one post fails (default)")
     g.add_argument("--stop-on-error", dest="continue_on_error", action="store_false")
@@ -367,6 +369,21 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
     if a.limit:
         picked = picked[: a.limit]
     chosen = [(n, coll.post_ids[n - 1]) for n in picked]
+
+    # A full-collection download is the classic fat-finger outcome (an unquoted
+    # share URL eats the flags after its '&'), so it asks first. Anything that
+    # shows intent skips the prompt: -I/--limit/-n/-y, agent mode, or no TTY.
+    if (not a.items and not a.limit and not a.dry_run and not a.yes
+            and not cfg.agent and sys.stdin.isatty()):
+        _out(f"{label}: about to download ALL {total} entries "
+             f"(often 1.5-2 GB each). -I picks a subset; -y skips this prompt.", cfg)
+        try:
+            reply = input("proceed? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            _out("aborted", cfg)
+            return EXIT_OK
 
     ev().emit("run_start", kind="collection", collection_id=collection_id,
               title=label, total=total, selected=len(chosen),
