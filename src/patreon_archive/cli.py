@@ -111,8 +111,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("-i", "-I", "--items", default=None, metavar="SPEC",
                    help="which collection entries to fetch, 1-based, 1 = oldest: "
                         "'1-5', '3,7,9', '2-', '-3' (third from last), '1-3,-2-'. "
-                        "Parenthesised parts are excluded: '1-,(2-3)' is all but 2 and 3. "
-                        "Quote it -- '(' and ')' are shell syntax")
+                        "An 'x' prefix excludes: 1-,x2-3 is all but 2 and 3 "
+                        "(needs no quoting in any shell). '(2-3)' does the same "
+                        "but must be quoted, since parens are shell syntax")
     g.add_argument("-x", "--exclude", default=None, metavar="SPEC",
                    help="entries to leave out; same syntax without the parens, "
                         "so no quoting needed")

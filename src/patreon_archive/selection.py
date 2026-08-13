@@ -108,6 +108,10 @@ def _classify(spec: str) -> tuple[list[str], list[str]]:
         if tok.startswith("(") and tok.endswith(")"):
             # A paren group may hold several comma-separated ranges of its own.
             exclude.extend(_split_tokens(tok[1:-1]))
+        elif tok[:1] in ("x", "X"):
+            # Letters are the only prefix no shell rewrites: '(' is syntax,
+            # '{2-3,7}' silently brace-expands, '^' is a zsh glob operator.
+            exclude.append(tok[1:])
         else:
             include.append(tok)
     return include, exclude
