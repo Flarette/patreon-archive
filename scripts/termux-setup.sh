@@ -46,9 +46,26 @@ else
     exit 1
 fi
 
+say "Configuring defaults"
+# The cookie path and destination live in the environment, not in a shell
+# wrapper: a `pa()` function would shadow the real `pa` binary and swallow
+# subcommands like `pa status`. Login shells read .bash_profile, not .bashrc,
+# so bridge the two while we are here.
+grep -q 'bashrc' "$HOME/.bash_profile" 2>/dev/null || \
+    printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' >> "$HOME/.bash_profile"
+sed -i '/^pa() {/d' "$HOME/.bashrc" 2>/dev/null || true
+grep -q PATREON_ARCHIVE_OUTPUT "$HOME/.bashrc" 2>/dev/null || cat >> "$HOME/.bashrc" <<'RC'
+
+# patreon-archive defaults; `pa <url>` needs nothing else
+export PATREON_ARCHIVE_COOKIES="$HOME/patreon-cookies.txt"
+export PATREON_ARCHIVE_OUTPUT="$HOME/storage/movies"
+RC
+grep -q termux-wake-lock "$HOME/.bashrc" 2>/dev/null || \
+    printf '\n# hold CPU awake whenever Termux is running (released on app exit)\ntermux-wake-lock\n' >> "$HOME/.bashrc"
+
 say "Verifying"
-patreon-archive --version
-echo "installed at: $(command -v patreon-archive)"
+pa --version
+echo "installed at: $(command -v pa)"
 
 say "Checking ffmpeg"
 ffmpeg -version | head -1
@@ -69,8 +86,7 @@ so export them on your desktop and copy the file here:
 
 Then, on the tablet:
 
-    patreon-archive get --cookies-file ~/patreon-cookies.txt \\
-        -o "$DEST" '<patreon url>'
+    pa '<patreon url>'
 
 Long downloads:
     termux-wake-lock          # before starting

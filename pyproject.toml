@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "patreon-archive"
-version = "0.1.1"
+version = "0.2.0"
 description = "Download video from Patreon posts you are entitled to view."
 requires-python = ">=3.12"
 dependencies = [
@@ -21,6 +21,7 @@ dependencies = [
 vimeo = ["curl_cffi==0.16.0"]
 
 [project.scripts]
+pa = "patreon_archive.cli:main"
 patreon-archive = "patreon_archive.cli:main"
 
 [tool.hatch.build.targets.wheel]

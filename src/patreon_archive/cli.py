@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import dataclasses
+import os
 import queue
 import re
 import sys
@@ -13,6 +14,7 @@ import yt_dlp
 
 from . import __version__
 from .api.client import PatreonApi, post_url
+from .archive import FORMATS as ARCHIVE_FORMATS, make_archive
 from .auth import preflight
 from .auth.cookies import materialized_jar
 from .config import Config, DEFAULT_OUTTMPL, OUTTMPL_WITH_ID, parse_browser_spec
@@ -36,6 +38,8 @@ def extract_post_id(url: str) -> str | None:
 
 def _looks_like_url(arg: str) -> str | bool:
     return arg.startswith(("http://", "https://", "www.patreon.com", "patreon.com"))
+
+DEFAULT_OUTPUT_DIR = "downloads"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -67,8 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-b", "--browser", default="firefox",
                         help="cookie source, e.g. firefox, 'chrome:Profile 1' (default: firefox)")
-    common.add_argument("--cookies-file", help="Netscape cookies.txt instead of a browser")
-    common.add_argument("-o", "--output-dir", default="downloads", type=Path)
+    common.add_argument("--cookies-file",
+                        help="Netscape cookies.txt instead of a browser "
+                             "(env PATREON_ARCHIVE_COOKIES)")
+    common.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR, type=Path,
+                        help=f"destination (default: {DEFAULT_OUTPUT_DIR}; "
+                             "env PATREON_ARCHIVE_OUTPUT)")
     common.add_argument("--temp-dir", type=Path, default=None)
     common.add_argument("--state-db", type=Path, default=None,
                         help="default: <output-dir>/.patreon-archive.db")
@@ -100,14 +108,24 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--force", action="store_true", help="re-download even if state says complete")
     g.add_argument("-n", "--dry-run", action="store_true", help="resolve only, download nothing")
     g.add_argument("--limit", type=int, default=None, help="stop after N posts (collections)")
-    g.add_argument("-I", "--items", default=None, metavar="SPEC",
-                   help="which collection entries to fetch, 1-based: '1-5', '3,7,9', "
-                        "'2-', '-3' (third from last), '1-3,-2-'")
+    g.add_argument("-i", "-I", "--items", default=None, metavar="SPEC",
+                   help="which collection entries to fetch, 1-based, 1 = oldest: "
+                        "'1-5', '3,7,9', '2-', '-3' (third from last), '1-3,-2-'. "
+                        "Parenthesised parts are excluded: '1-,(2-3)' is all but 2 and 3. "
+                        "Quote it -- '(' and ')' are shell syntax")
+    g.add_argument("-x", "--exclude", default=None, metavar="SPEC",
+                   help="entries to leave out; same syntax without the parens, "
+                        "so no quoting needed")
     g.add_argument("-j", "--concurrency", type=int, default=1, metavar="N",
                    help="download N posts at once (collections); each gets its own "
                         "progress row. Default 1 = yt-dlp's normal single-line progress")
-    g.add_argument("--list", action="store_true",
+    g.add_argument("-l", "--list", action="store_true",
                    help="list collection entries with their numbers, download nothing")
+    g.add_argument("-a", "--archive", default=None, metavar="FORMAT",
+                   choices=ARCHIVE_FORMATS,
+                   help="after downloading, pack this run's files into one archive: "
+                        f"{', '.join(ARCHIVE_FORMATS)}. zip/tar store without "
+                        "compressing, since video does not shrink")
     g.add_argument("-y", "--yes", action="store_true",
                    help="skip the confirmation before a full-collection download")
     g.add_argument("--continue-on-error", action="store_true", default=True,
@@ -197,6 +215,14 @@ Example:
 
 
 def _config(a: argparse.Namespace) -> Config:
+    # Env defaults let a machine with no browser (Android) carry its cookie file
+    # and destination without a shell wrapper. Explicit flags still win.
+    if not a.cookies_file:
+        a.cookies_file = os.environ.get("PATREON_ARCHIVE_COOKIES") or None
+    env_out = os.environ.get("PATREON_ARCHIVE_OUTPUT")
+    if env_out and a.output_dir == Path(DEFAULT_OUTPUT_DIR):
+        a.output_dir = Path(env_out)
+
     out = a.output_dir.expanduser().resolve()
     return Config(
         archive_root=out,
@@ -264,8 +290,12 @@ def _persist(store: Store, res, pid: str, url: str, dry_run: bool) -> None:
     )
 
 
-def _one_post(cfg: Config, store: Store, url: str, dry_run: bool) -> Outcome:
-    """Download a single post URL and record its outcome. Never raises."""
+def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
+              collect: list[Path] | None = None) -> Outcome:
+    """Download a single post URL and record its outcome. Never raises.
+
+    `collect` gathers the files this run actually produced, for -a.
+    """
     post_id = extract_post_id(url)
     if post_id:
         proceed, why = store.should_process(
@@ -302,6 +332,8 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool) -> Outcome:
         detail=res.detail,
     )
     if res.outcome == Outcome.COMPLETE and res.filepath:
+        if collect is not None and res.filepath.exists():
+            collect.append(res.filepath)
         mb = res.filepath.stat().st_size / (1024 * 1024)
         _out(f"  ok  {res.filepath.name}  ({mb:.1f} MiB)", cfg)
     elif res.outcome == Outcome.NO_ACCESS:
@@ -334,10 +366,13 @@ def cmd_get(cfg: Config, a: argparse.Namespace) -> int:
             return _collection(cfg, a, m.group(1))
 
         store = Store(cfg.state_db)
+        produced: list[Path] = []
         try:
-            return _EXIT[_one_post(cfg, store, a.url, a.dry_run)]
+            outcome = _one_post(cfg, store, a.url, a.dry_run, produced)
         finally:
             store.close()
+        _maybe_archive(cfg, a, produced)
+        return _EXIT[outcome]
 
 
 def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
@@ -355,17 +390,33 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
     label = coll.title or f"collection {collection_id}"
     total = len(coll.post_ids)
 
+    entries = coll.entries or []
+    by_id = {e.post_id: e for e in entries}
+
     if a.list:
+        # post_id and url stay in the event: the human table drops them, but
+        # machine consumers still need an identifier.
         ev().emit("collection_listed", collection_id=collection_id, title=label,
                   total=total,
-                  entries=[{"index": n, "post_id": p, "url": post_url(p)}
+                  entries=[{"index": n, "post_id": p, "url": post_url(p),
+                            "title": (by_id.get(p).title if by_id.get(p) else None),
+                            "published": (by_id.get(p).published if by_id.get(p) else None),
+                            "duration": (by_id.get(p).duration if by_id.get(p) else None)}
                            for n, p in enumerate(coll.post_ids, 1)])
-        _out(f"{label}: {total} posts", cfg)
+        _out(f"{label}: {total} posts  (1 = oldest)", cfg)
         for n, pid in enumerate(coll.post_ids, 1):
-            _out(f"  {n:3}  {pid}  {post_url(pid)}", cfg)
+            e = by_id.get(pid)
+            title = (e.title if e and e.title else "?")
+            # Patreon omits posts the session cannot see from `included`, so a
+            # row with no metadata at all is an entitlement boundary, not a gap.
+            blind = e is None or (e.title is None and e.published is None)
+            mark = "  [no access]" if (blind or e.can_view is False) else ""
+            _out(f"  {n:3}  {_hms(e.duration if e else None):>9}  "
+                 f"{(e.published if e and e.published else '?'):10}  {title}{mark}", cfg)
         return EXIT_OK
 
-    picked = parse_items(a.items, total) if a.items else list(range(1, total + 1))
+    picked = (parse_items(a.items or "", total, a.exclude)
+              if (a.items or a.exclude) else list(range(1, total + 1)))
     if a.limit:
         picked = picked[: a.limit]
     chosen = [(n, coll.post_ids[n - 1]) for n in picked]
@@ -393,6 +444,7 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
          f"{f', {cfg.concurrency} at a time' if cfg.concurrency > 1 else ''}\n", cfg)
 
     tally: dict[Outcome, int] = {}
+    produced: list[Path] = []
     store = Store(cfg.state_db)
     lock = threading.Lock()
 
@@ -402,12 +454,12 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
 
     try:
         if cfg.concurrency > 1:
-            _parallel(cfg, store, chosen, a, record)
+            _parallel(cfg, store, chosen, a, record, produced)
         else:
             for n, pid in chosen:
                 _out(f"[{n}/{total}] post {pid}", cfg)
                 try:
-                    outcome = _one_post(cfg, store, post_url(pid), a.dry_run)
+                    outcome = _one_post(cfg, store, post_url(pid), a.dry_run, produced)
                 except KeyboardInterrupt:
                     print("\ninterrupted", file=sys.stderr)
                     break
@@ -432,11 +484,31 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
     for oc in (Outcome.COMPLETE, Outcome.NO_ACCESS, Outcome.INDETERMINATE, Outcome.FAILED):
         if tally.get(oc):
             _out(f"  {oc:16} {tally[oc]}", cfg)
+
+    _maybe_archive(cfg, a, produced)
     return code
 
 
+def _maybe_archive(cfg: Config, a: argparse.Namespace, produced: list[Path]) -> None:
+    """Pack what this run downloaded. Never turns a good run into a failure."""
+    if not getattr(a, "archive", None) or a.dry_run:
+        return
+    if not produced:
+        _out("nothing new downloaded, no archive written", cfg)
+        return
+    try:
+        out = make_archive(produced, cfg.archive_root, a.archive)
+    except PatreonArchiveError as exc:
+        _out(f"archive failed: {exc}", cfg, err=True)
+        return
+    mb = out.stat().st_size / (1024 * 1024)
+    ev().emit("archived", path=str(out), files=len(produced), bytes=out.stat().st_size)
+    _out(f"archived {len(produced)} file(s) -> {out.name}  ({mb:.1f} MiB)", cfg)
 
-def _parallel(cfg: Config, store: Store, chosen, a, record) -> None:
+
+
+def _parallel(cfg: Config, store: Store, chosen, a, record,
+              produced: list[Path] | None = None) -> None:
     """Run N posts at once, each owning one live progress row.
 
     Store writes are serialised: sqlite3 connections are not thread-safe.
@@ -471,6 +543,9 @@ def _parallel(cfg: Config, store: Store, chosen, a, record) -> None:
                     detail=res.detail,
                 )
                 if res.outcome == Outcome.COMPLETE and res.filepath:
+                    if produced is not None and res.filepath.exists():
+                        with store_lock:
+                            produced.append(res.filepath)
                     mb = res.filepath.stat().st_size / (1024 * 1024)
                     ui.log(f"  ok  [{n}] {res.filepath.name}  ({mb:.1f} MiB)")
                 elif a.dry_run:
@@ -521,6 +596,15 @@ def cmd_status(cfg: Config, post: str | None) -> int:
         return EXIT_OK
     finally:
         store.close()
+
+
+def _hms(seconds: float | None) -> str:
+    if not seconds:
+        return "-"
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02}:{sec:02}" if h else f"{m}:{sec:02}"
 
 
 def _out(msg: str, cfg: Config, *, err: bool = False) -> None:

@@ -27,11 +27,21 @@ class ApiError(PatreonArchiveError):
 
 
 @dataclass
+class Entry:
+    post_id: str
+    title: str | None = None
+    published: str | None = None      # ISO date, YYYY-MM-DD
+    duration: float | None = None     # seconds
+    can_view: bool | None = None
+
+
+@dataclass
 class Collection:
     collection_id: str
     title: str | None
     num_posts: int
     post_ids: list[str]
+    entries: list[Entry] | None = None
 
 
 class PatreonApi:
@@ -101,7 +111,11 @@ class PatreonApi:
         This endpoint hands back the full ordered post_ids list in one call, so
         no pagination is needed.
         """
-        doc = self.get(f"collection/{collection_id}")
+        doc = self.get(f"collection/{collection_id}", {
+            "include": "posts",
+            "fields[post]": "title,published_at,post_file,current_user_can_view",
+            "json-api-use-default-includes": "false",
+        })
         attrs = (doc.get("data") or {}).get("attributes") or {}
         ids = [str(i) for i in (attrs.get("post_ids") or [])]
         if not ids:
@@ -109,11 +123,36 @@ class PatreonApi:
                 f"Collection {collection_id} returned no post_ids. "
                 "It may be empty, or not visible to this account."
             )
+
+        # Patreon lists newest first; we number oldest first so entry 1 is stable
+        # as the collection grows. Reversed here and nowhere else, so post_ids,
+        # the --list numbering and index-based selection cannot drift apart.
+        ids.reverse()
+
+        # `included` order is not tied to post_ids, so index it by id.
+        meta: dict[str, dict] = {
+            str(i.get("id")): (i.get("attributes") or {})
+            for i in (doc.get("included") or []) if i.get("type") == "post"
+        }
+        entries = []
+        for pid in ids:
+            a = meta.get(pid) or {}
+            pf = a.get("post_file") or {}
+            published = a.get("published_at") or None
+            entries.append(Entry(
+                post_id=pid,
+                title=a.get("title"),
+                published=published[:10] if published else None,
+                duration=pf.get("duration") or pf.get("full_content_duration"),
+                can_view=a.get("current_user_can_view"),
+            ))
+
         return Collection(
             collection_id=str(collection_id),
             title=attrs.get("title") or attrs.get("name"),
             num_posts=int(attrs.get("num_posts") or len(ids)),
             post_ids=ids,
+            entries=entries,
         )
 
     def current_user(self) -> dict:
