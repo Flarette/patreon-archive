@@ -18,23 +18,16 @@ def parse_items(spec: str, total: int, exclude: str | None = None) -> list[int]:
         "-4--2"     -> the 4th-from-last through 2nd-from-last
         "3,7-9,-1"  -> combinations
 
-    A parenthesised token is subtracted from the set instead of added:
-        "1-,(2-3)"  -> everything except 2 and 3
-        "(5)"       -> everything except 5 (no includes means "all")
+    `exclude` takes the same syntax and is subtracted from the result. It is a
+    separate argument rather than an inline marker because every bracket-ish
+    spelling is shell syntax: '(2-3)' errors unquoted, '{2-3,7}' silently
+    brace-expands in bash and zsh, '^' is a zsh glob operator.
 
-    Duplicates are removed, first occurrence wins. `exclude` is the same syntax
-    without the parens, for shells where '(' would need quoting.
+    An empty `spec` with a non-empty `exclude` means "everything but those".
+    Duplicates are removed, first occurrence wins.
     """
-    if not spec or not spec.strip():
-        include_toks, exclude_toks = [], []
-    else:
-        include_toks, exclude_toks = _classify(spec)
-
-    if exclude:
-        # -x takes the same syntax without parens, for shells where '(' bites.
-        inc, exc = _classify(exclude)
-        exclude_toks.extend(inc)
-        exclude_toks.extend(exc)
+    include_toks = _split_tokens(spec) if spec and spec.strip() else []
+    exclude_toks = _split_tokens(exclude) if exclude and exclude.strip() else []
 
     def resolve(tok: str) -> int:
         n = int(tok)
@@ -58,8 +51,6 @@ def parse_items(spec: str, total: int, exclude: str | None = None) -> list[int]:
                 raise SelectionError(f"cannot parse item spec {part!r}") from exc
         return out
 
-    # No include tokens at all means "everything", so '(2-3)' alone reads as
-    # "all but 2 and 3" rather than as an empty selection.
     chosen = expand(include_toks) if include_toks else list(range(1, total + 1))
     dropped = set(expand(exclude_toks))
 
@@ -73,48 +64,15 @@ def parse_items(spec: str, total: int, exclude: str | None = None) -> list[int]:
         seen.add(i)
         picked.append(i)
     if not picked:
-        raise SelectionError(f"item spec {spec!r} selected nothing")
+        raise SelectionError(
+            f"item spec {spec!r} with exclusions {exclude!r} selected nothing"
+            if exclude else f"item spec {spec!r} selected nothing"
+        )
     return picked
 
 
 def _split_tokens(spec: str) -> list[str]:
-    """Split on commas that are not inside parens, so '(2-3,7)' stays one token."""
-    out: list[str] = []
-    depth = 0
-    buf = ""
-    for ch in spec:
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth < 0:
-                raise SelectionError(f"unbalanced ')' in item spec {spec!r}")
-        if ch == "," and depth == 0:
-            out.append(buf)
-            buf = ""
-            continue
-        buf += ch
-    if depth:
-        raise SelectionError(f"unbalanced '(' in item spec {spec!r}")
-    out.append(buf)
-    return [t.strip() for t in out if t.strip()]
-
-
-def _classify(spec: str) -> tuple[list[str], list[str]]:
-    """Separate include tokens from parenthesised exclusion tokens."""
-    include: list[str] = []
-    exclude: list[str] = []
-    for tok in _split_tokens(spec):
-        if tok.startswith("(") and tok.endswith(")"):
-            # A paren group may hold several comma-separated ranges of its own.
-            exclude.extend(_split_tokens(tok[1:-1]))
-        elif tok[:1] in ("x", "X"):
-            # Letters are the only prefix no shell rewrites: '(' is syntax,
-            # '{2-3,7}' silently brace-expands, '^' is a zsh glob operator.
-            exclude.append(tok[1:])
-        else:
-            include.append(tok)
-    return include, exclude
+    return [t.strip() for t in spec.split(",") if t.strip()]
 
 
 def _split_range(part: str) -> tuple[str, str, str]:

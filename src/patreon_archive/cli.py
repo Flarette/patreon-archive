@@ -110,13 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--limit", type=int, default=None, help="stop after N posts (collections)")
     g.add_argument("-i", "-I", "--items", default=None, metavar="SPEC",
                    help="which collection entries to fetch, 1-based, 1 = oldest: "
-                        "'1-5', '3,7,9', '2-', '-3' (third from last), '1-3,-2-'. "
-                        "An 'x' prefix excludes: 1-,x2-3 is all but 2 and 3 "
-                        "(needs no quoting in any shell). '(2-3)' does the same "
-                        "but must be quoted, since parens are shell syntax")
+                        "'1-5', '3,7,9', '2-', '-3' (third from last), '1-3,-2-'")
     g.add_argument("-x", "--exclude", default=None, metavar="SPEC",
-                   help="entries to leave out; same syntax without the parens, "
-                        "so no quoting needed")
+                   help="entries to leave out, same syntax as -i. Omit -i to mean "
+                        "'everything but these': -x 2-3 downloads all but 2 and 3")
     g.add_argument("-j", "--concurrency", type=int, default=1, metavar="N",
                    help="download N posts at once (collections); each gets its own "
                         "progress row. Default 1 = yt-dlp's normal single-line progress")
