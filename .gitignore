@@ -7,3 +7,6 @@ research/*/
 .venv/
 __pycache__/
 *.pyc
+
+# Default download destination; never an input to the build
+downloads/
