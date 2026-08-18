@@ -91,7 +91,7 @@ class MultilineProgress:
                 self.set(
                     slot,
                     f"  {label:38.38} {pct} {_human(done)}/{_human(total)} "
-                    f"{_human(speed)}/s ETA {eta or '?'}s{frag}",
+                    f"{_human(speed)}/s ETA {int(eta) if eta else '?'}s{frag}",
                 )
             elif status == "finished":
                 self.set(slot, f"  {label:38.38} downloaded, muxing…")

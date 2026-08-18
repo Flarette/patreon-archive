@@ -91,6 +91,13 @@ def build_params(cfg: Config, hooks: list | None = None) -> dict:
         params["cookiesfrombrowser"] = cfg.browser_spec
     if cfg.cookie_file:
         params["cookiefile"] = cfg.cookie_file
+    if cfg.embed_metadata:
+        # The filename carries no date, so the upload date has to survive in the
+        # container's own tags. Needs ffmpeg, which preflight already checks.
+        params["postprocessors"] = [
+            {"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True,
+             "add_infojson": "if_exists"},
+        ]
     if hooks:
         params["progress_hooks"] = hooks
     params.update(cfg.extra_ytdlp)

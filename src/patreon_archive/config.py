@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# No [%(id)s] suffix by default -- readable names. `--keep-id` restores it, which
-# is worth doing for a bulk archive: two posts can share a title, and without the
-# id the second silently overwrites the first.
-DEFAULT_OUTTMPL = "%(channel,uploader,extractor)s/%(upload_date>%Y-%m-%d,epoch>%Y-%m-%d)s - %(title).150B.%(ext)s"
-OUTTMPL_WITH_ID = "%(channel,uploader,extractor)s/%(upload_date>%Y-%m-%d,epoch>%Y-%m-%d)s - %(title).150B [%(id)s].%(ext)s"
+# No date prefix and no [%(id)s] suffix by default -- readable names. The upload
+# date lives in the file's own metadata tags (see `embed_metadata`) and in `-l`.
+# `--keep-id` restores the id, which is worth doing for a bulk archive: two posts
+# can share a title, and without the id the second silently overwrites the first.
+DEFAULT_OUTTMPL = "%(channel,uploader,extractor)s/%(title).150B.%(ext)s"
+OUTTMPL_WITH_ID = "%(channel,uploader,extractor)s/%(title).150B [%(id)s].%(ext)s"
 
 
 @dataclass(frozen=True)
@@ -24,9 +25,10 @@ class Config:
     request_sleep: float = 0.0
     http_retries: int = 10
     extractor_retries: int = 3
-    write_thumbnails: bool = True
-    write_infojson: bool = True
-    write_subs: bool = True
+    write_thumbnails: bool = False
+    write_infojson: bool = False
+    write_subs: bool = False
+    embed_metadata: bool = True
     quiet: bool = False
     force: bool = False
     concurrency: int = 1

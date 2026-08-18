@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "patreon-archive"
-version = "0.2.1"
+version = "0.3.0"
 description = "Download video from Patreon posts you are entitled to view."
 requires-python = ">=3.12"
 dependencies = [

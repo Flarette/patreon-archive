@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import dataclasses
+import datetime
 import os
 import queue
 import re
@@ -11,6 +12,7 @@ import threading
 from pathlib import Path
 
 import yt_dlp
+from yt_dlp.utils import sanitize_filename
 
 from . import __version__
 from .api.client import PatreonApi, post_url
@@ -40,6 +42,52 @@ def _looks_like_url(arg: str) -> str | bool:
     return arg.startswith(("http://", "https://", "www.patreon.com", "patreon.com"))
 
 DEFAULT_OUTPUT_DIR = "downloads"
+
+
+def _resolve_output(value: str | None) -> Path:
+    """A bare name is a folder under the default root; anything path-shaped is a path.
+
+    Keeps `-o films` ergonomic without making it ambiguous with `-o ~/films`.
+    """
+    base = Path(os.environ.get("PATREON_ARCHIVE_OUTPUT") or DEFAULT_OUTPUT_DIR)
+    base = base.expanduser().resolve()
+    if not value:
+        return base
+    # Tested on the raw string, not on Path.parts: Path('./films').parts drops the
+    # './', which would read an explicitly cwd-relative path as a bare name.
+    bare = "/" not in value and os.sep not in value and not value.startswith("~")
+    return (base / value) if bare else Path(value).expanduser().resolve()
+
+
+def _folder_name(label: str) -> str:
+    """Collection title -> one safe path segment."""
+    name = sanitize_filename(label, restricted=False).strip(" .")
+    return name[:120] or "collection"
+
+
+def _available(entry) -> bool:
+    """Whether the session can see this entry, by the same rule -l prints.
+
+    Patreon omits posts the session cannot view from `included`, so a row with no
+    metadata at all is an entitlement boundary rather than a gap. `can_view` of
+    None is unknown, which stays selectable.
+    """
+    if entry is None:
+        return False
+    if entry.can_view is False:
+        return False
+    return not (entry.title is None and entry.published is None)
+
+
+def _pretty_date(iso: str | None) -> str:
+    """'2024-06-06' -> 'June 6, 2024'. Built by hand: %-d is not portable to bionic."""
+    if not iso:
+        return "?"
+    try:
+        d = datetime.date.fromisoformat(iso)
+    except ValueError:
+        return iso
+    return f"{d.strftime('%B')} {d.day}, {d.year}"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -74,9 +122,12 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--cookies-file",
                         help="Netscape cookies.txt instead of a browser "
                              "(env PATREON_ARCHIVE_COOKIES)")
-    common.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR, type=Path,
-                        help=f"destination (default: {DEFAULT_OUTPUT_DIR}; "
-                             "env PATREON_ARCHIVE_OUTPUT)")
+    common.add_argument("-o", "--output-dir", default=None,
+                        help="destination. A bare name is a folder under the default "
+                             f"root ('-o films' -> {DEFAULT_OUTPUT_DIR}/films); anything "
+                             "path-shaped ('~/movies', './x', '/a/b') is used as given. "
+                             f"Created if missing. Default root: {DEFAULT_OUTPUT_DIR} "
+                             "(env PATREON_ARCHIVE_OUTPUT)")
     common.add_argument("--temp-dir", type=Path, default=None)
     common.add_argument("--state-db", type=Path, default=None,
                         help="default: <output-dir>/.patreon-archive.db")
@@ -90,9 +141,14 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--concurrent-fragments", type=int, default=4,
                         help="native HLS only; silently ignored when yt-dlp delegates to ffmpeg")
     common.add_argument("--request-sleep", type=float, default=0.0)
-    common.add_argument("--no-thumbnails", action="store_true")
-    common.add_argument("--no-infojson", action="store_true")
-    common.add_argument("--no-subs", action="store_true")
+    common.add_argument("--thumbnails", action="store_true",
+                        help="also save the cover image")
+    common.add_argument("--infojson", action="store_true",
+                        help="also save the .info.json metadata sidecar")
+    common.add_argument("--subs", action="store_true",
+                        help="also save subtitles, when the post has them")
+    common.add_argument("--no-embed-metadata", action="store_true",
+                        help="skip writing title/date/description into the file's own tags")
     common.add_argument("-q", "--quiet", action="store_true")
     common.add_argument("--agent", action="store_true",
                         help="machine-readable JSONL events on stdout (one object per "
@@ -217,11 +273,8 @@ def _config(a: argparse.Namespace) -> Config:
     # and destination without a shell wrapper. Explicit flags still win.
     if not a.cookies_file:
         a.cookies_file = os.environ.get("PATREON_ARCHIVE_COOKIES") or None
-    env_out = os.environ.get("PATREON_ARCHIVE_OUTPUT")
-    if env_out and a.output_dir == Path(DEFAULT_OUTPUT_DIR):
-        a.output_dir = Path(env_out)
 
-    out = a.output_dir.expanduser().resolve()
+    out = _resolve_output(a.output_dir)
     return Config(
         archive_root=out,
         temp_dir=(a.temp_dir or out / ".tmp").expanduser().resolve(),
@@ -233,9 +286,10 @@ def _config(a: argparse.Namespace) -> Config:
         ffmpeg_location=a.ffmpeg_location,
         frag_concurrency=a.concurrent_fragments,
         request_sleep=a.request_sleep,
-        write_thumbnails=not a.no_thumbnails,
-        write_infojson=not a.no_infojson,
-        write_subs=not a.no_subs,
+        write_thumbnails=a.thumbnails,
+        write_infojson=a.infojson,
+        write_subs=a.subs,
+        embed_metadata=not a.no_embed_metadata,
         quiet=a.quiet,
         force=getattr(a, "force", False),
         concurrency=max(1, getattr(a, "concurrency", 1)),
@@ -405,26 +459,48 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
         for n, pid in enumerate(coll.post_ids, 1):
             e = by_id.get(pid)
             title = (e.title if e and e.title else "?")
-            # Patreon omits posts the session cannot see from `included`, so a
-            # row with no metadata at all is an entitlement boundary, not a gap.
-            blind = e is None or (e.title is None and e.published is None)
-            mark = "  [no access]" if (blind or e.can_view is False) else ""
+            mark = "" if _available(e) else "  [no access]"
             _out(f"  {n:3}  {_hms(e.duration if e else None):>9}  "
-                 f"{(e.published if e and e.published else '?'):10}  {title}{mark}", cfg)
+                 f"{_pretty_date(e.published if e else None):18}  {title}{mark}", cfg)
         return EXIT_OK
 
     picked = (parse_items(a.items or "", total, a.exclude)
               if (a.items or a.exclude) else list(range(1, total + 1)))
+
+    # Indices number the whole collection, exactly as -l prints them, so -3 means
+    # the same entry in both. Entries the session cannot view are then dropped, so
+    # a tail grab yields downloadable posts instead of a run of no_access rows.
+    # Filtered before --limit, so --limit 5 means five real downloads.
+    blocked = [n for n in picked if not _available(by_id.get(coll.post_ids[n - 1]))]
+    picked = [n for n in picked if n not in set(blocked)]
     if a.limit:
         picked = picked[: a.limit]
+
+    if blocked:
+        _out(f"skipping {len(blocked)} of {len(blocked) + len(picked)} selected: "
+             f"no access to {', '.join(str(n) for n in blocked)}", cfg)
+    if not picked:
+        ev().emit("run_done", summary={}, selected=0, exit_code=EXIT_NO_ACCESS)
+        _out("nothing to download: no access to any selected entry", cfg, err=True)
+        return EXIT_NO_ACCESS
+
     chosen = [(n, coll.post_ids[n - 1]) for n in picked]
+    # Progress rows and per-post lines read better with a title than a post id.
+    labels = {pid: (by_id[pid].title if by_id.get(pid) and by_id[pid].title else None)
+              for _, pid in chosen}
+
+    # Everything lands in a folder named after the collection, so two collections
+    # sharing a destination stay separate. State and temp stay at the root: the
+    # db is what makes re-runs resume, and it is per-destination, not per-folder.
+    cfg = dataclasses.replace(cfg, archive_root=cfg.archive_root / _folder_name(label))
+    cfg.archive_root.mkdir(parents=True, exist_ok=True)
 
     # A full-collection download is the classic fat-finger outcome (an unquoted
     # share URL eats the flags after its '&'), so it asks first. Anything that
     # shows intent skips the prompt: -I/--limit/-n/-y, agent mode, or no TTY.
     if (not a.items and not a.limit and not a.dry_run and not a.yes
             and not cfg.agent and sys.stdin.isatty()):
-        _out(f"{label}: about to download ALL {total} entries "
+        _out(f"{label}: about to download ALL {len(picked)} accessible entries "
              f"(often 1.5-2 GB each). -I picks a subset; -y skips this prompt.", cfg)
         try:
             reply = input("proceed? [y/N] ").strip().lower()
@@ -439,7 +515,8 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
               concurrency=cfg.concurrency, dry_run=a.dry_run,
               post_ids=[pid for _, pid in chosen])
     _out(f"{label}: {total} posts, selected {len(chosen)}"
-         f"{f', {cfg.concurrency} at a time' if cfg.concurrency > 1 else ''}\n", cfg)
+         f"{f', {cfg.concurrency} at a time' if cfg.concurrency > 1 else ''}\n"
+         f"  -> {cfg.archive_root}\n", cfg)
 
     tally: dict[Outcome, int] = {}
     produced: list[Path] = []
@@ -452,10 +529,10 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
 
     try:
         if cfg.concurrency > 1:
-            _parallel(cfg, store, chosen, a, record, produced)
+            _parallel(cfg, store, chosen, a, record, produced, labels)
         else:
             for n, pid in chosen:
-                _out(f"[{n}/{total}] post {pid}", cfg)
+                _out(f"[{n}/{total}] {labels.get(pid) or f'post {pid}'}", cfg)
                 try:
                     outcome = _one_post(cfg, store, post_url(pid), a.dry_run, produced)
                 except KeyboardInterrupt:
@@ -506,7 +583,8 @@ def _maybe_archive(cfg: Config, a: argparse.Namespace, produced: list[Path]) -> 
 
 
 def _parallel(cfg: Config, store: Store, chosen, a, record,
-              produced: list[Path] | None = None) -> None:
+              produced: list[Path] | None = None,
+              labels: dict[str, str | None] | None = None) -> None:
     """Run N posts at once, each owning one live progress row.
 
     Store writes are serialised: sqlite3 connections are not thread-safe.
@@ -520,7 +598,7 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
     with MultilineProgress(slots) as ui:
         def work(n: int, pid: str) -> Outcome:
             slot = free.get()
-            label = f"[{n}] {pid}"
+            label = f"[{n}] {(labels or {}).get(pid) or pid}"
             try:
                 ui.set(slot, f"  {label:38.38} starting…")
                 ev().emit("post_start", index=n, post_id=pid, url=post_url(pid))
