@@ -166,6 +166,9 @@ class Store:
                    VALUES (?,?,?,?,?,?) ON CONFLICT(content_sha256) DO NOTHING""",
                 (content_sha, p.stat().st_size, None, p.suffix.lstrip("."), str(p), _now()),
             )
+        dedup_key = self.dedup_key(media_id, url_md5, output_path)
+        if media_id and output_path:
+            self._adopt_legacy_row(post_id, source_kind, media_id, dedup_key, output_path)
         self.db.execute(
             """INSERT INTO post_media (post_id, media_id, url_md5, source_kind, provider,
                                        content_sha256, output_path, state, detail, updated_at, dedup_key)
@@ -177,24 +180,47 @@ class Store:
                    detail         = excluded.detail,
                    updated_at     = excluded.updated_at""",
             (post_id, media_id, url_md5, source_kind, provider, content_sha, output_path,
-             state, detail, _now(), self.dedup_key(media_id, url_md5, output_path)),
+             state, detail, _now(), dedup_key),
         )
         self.db.commit()
+
+    def _adopt_legacy_row(self, post_id: str, source_kind: str, media_id: str,
+                          dedup_key: str, output_path: str) -> None:
+        """Give this post's pre-0.4 row for the same file its media id, in place.
+
+        output_owner ranks rows by rowid, so a fresh row would rank behind
+        another post's legacy row for that file and lose it the ownership.
+        """
+        if self.db.execute(
+            "SELECT 1 FROM post_media WHERE post_id = ? AND source_kind = ? AND dedup_key = ?",
+            (post_id, source_kind, dedup_key),
+        ).fetchone():
+            return
+        key = self.path_key(output_path)
+        for row in self.db.execute(
+            """SELECT rowid, output_path FROM post_media WHERE post_id = ? AND source_kind = ?
+               AND media_id IS NULL AND output_path IS NOT NULL""",
+            (post_id, source_kind),
+        ).fetchall():
+            if self.path_key(row["output_path"]) == key:
+                self.db.execute(
+                    "UPDATE post_media SET media_id = ?, dedup_key = ? WHERE rowid = ?",
+                    (media_id, dedup_key, row["rowid"]),
+                )
+                return
 
     def output_owner(self, path: str) -> str | None:
         """The video recorded as having completed `path`, or a case alias of it.
 
         Rows written before 0.4 carry no media id; their post id is the owner.
-        A row with a media id was written by the video that claimed the path, so
-        it outranks them all. Among legacy rows sharing one file, the first to
-        record it wins: its download is the one whose content is on disk. Whether
-        the file is still there does not matter: a recorded path stays its owner's.
+        Should several rows claim one file, the first to record it wins: its
+        download is the one whose content is on disk. Whether the file is still
+        there does not matter: a recorded path stays its owner's.
         """
         key = self.path_key(path)
         cur = self.db.execute(
             """SELECT COALESCE(media_id, post_id) AS owner, output_path FROM post_media
-               WHERE output_path IS NOT NULL AND state = 'complete'
-               ORDER BY media_id IS NULL, rowid"""
+               WHERE output_path IS NOT NULL AND state = 'complete' ORDER BY rowid"""
         )
         for row in cur:
             if self.path_key(row["output_path"]) == key:

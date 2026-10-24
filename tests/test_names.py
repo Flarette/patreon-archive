@@ -226,8 +226,8 @@ def test_second_recorded_legacy_owner_gets_its_own_file(patreon, media, legacy_p
 
 
 def test_rerecorded_first_owner_keeps_the_name_from_the_legacy_row(patreon, media, legacy_pair):
-    """A row with a media id was written by a video that claimed the path, so it
-    outranks a legacy row whatever their insertion order."""
+    """Re-recording upgrades the first owner's legacy row in place, so it keeps
+    its rank over the second post's legacy row for the same file."""
     assert patreon.run(post_url("2202"), "--force").rc == 0
 
     r = patreon.run(post_url("2201"), "--force")
@@ -235,6 +235,36 @@ def test_rerecorded_first_owner_keeps_the_name_from_the_legacy_row(patreon, medi
     assert r.rc == 0, r
     assert r.files == ["Creator/Live [2201].mp4", "Creator/Live.mp4"]
     assert media_rows(patreon, "2201") == [("2201", "Creator/Live [2201].mp4")]
+
+
+CUSTOM = ("--outtmpl", "%(channel)s/%(title)s.%(ext)s")
+
+
+def test_custom_template_reuse_does_not_take_a_legacy_owners_file(patreon, legacy_pair):
+    """A user template never claims a name, so yt-dlp's reuse of the shared file
+    records it without outranking the post whose download the file holds."""
+    assert patreon.run(post_url("2201"), *CUSTOM, "--force").rc == 0
+
+    r = patreon.run(post_url("2202"), "--force")
+
+    assert r.rc == 0, r
+    assert r.files == ["Creator/Live.mp4"]
+    assert media_rows(patreon, "2202") == [("2202", "Creator/Live.mp4")]
+
+
+def test_custom_template_reuse_does_not_take_a_lone_legacy_file(patreon, media):
+    (patreon.out / "Creator").mkdir(parents=True)
+    path = patreon.out / "Creator/Live.mp4"
+    shutil.copyfile(media["a"], path)
+    patreon.post("2202", "Live", media="a")
+    patreon.post("2201", "Live", media="b")
+    legacy_row(patreon.store(), "2202", "Live", path)
+    assert patreon.run(post_url("2201"), *CUSTOM).rc == 0
+
+    r = patreon.run(post_url("2202"), "--force")
+
+    assert r.rc == 0, r
+    assert r.files == ["Creator/Live.mp4"]
 
 
 def test_long_creator_and_title_keep_the_suffix(patreon):
