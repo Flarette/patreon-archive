@@ -581,8 +581,10 @@ def _sigint_watch():
         seen.set()
         previous(signum, frame)
 
-    signal.signal(signal.SIGINT, handler)
     try:
+        # Inside the try: a Ctrl-C landing right after installation must still
+        # find the previous handler restored.
+        signal.signal(signal.SIGINT, handler)
         yield seen
     finally:
         signal.signal(signal.SIGINT, previous)
