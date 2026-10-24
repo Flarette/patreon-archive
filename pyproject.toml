@@ -19,6 +19,8 @@ dependencies = [
 # It is only used for the Vimeo embed fallback; native Patreon HLS does not
 # touch it, so it stays optional and the CLI degrades with a warning.
 vimeo = ["curl_cffi==0.16.0"]
+# The test suite also needs ffmpeg and ffprobe on PATH.
+dev = ["pytest"]
 
 [project.scripts]
 pa = "patreon_archive.cli:main"
