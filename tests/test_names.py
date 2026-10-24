@@ -272,10 +272,12 @@ def test_multi_video_post_with_a_missing_entry_resumes(patreon):
 
 
 # Non-ASCII too: SQLite's NOCASE folds ASCII only. And one spelling in NFC, the
-# other in NFD: APFS names one file either way.
+# other in NFD: APFS names one file either way. The Greek pair differs in both
+# case and form, and only matches when normalizing after casefolding as well.
 @pytest.mark.parametrize(("theirs", "mine"), [("Clip", "clip"), ("Été", "été"),
-                                              ("Été", "Été")],
-                         ids=["ascii", "non-ascii", "nfd"])
+                                              ("Été", "Été"),
+                                              ("ΐ", "Ϊ́")],
+                         ids=["ascii", "non-ascii", "nfd", "case-and-form"])
 def test_moved_away_file_still_owns_its_case_alias(patreon, theirs, mine):
     patreon.post("1", theirs, media="a")
     patreon.post("2", mine, media="b")

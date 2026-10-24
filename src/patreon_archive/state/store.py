@@ -54,12 +54,14 @@ class Store:
     def path_key(path: str | Path) -> str:
         """The ownership identity of an output path.
 
-        Normalized and casefolded on every filesystem: APFS and Android storage
-        treat paths that differ only in case, or in NFC/NFD form, as one file.
-        SQLite's NOCASE and lower() fold ASCII only, so the comparison happens here
-        rather than in SQL.
+        Unicode canonical caseless matching, NFD(casefold(NFD(path))), on every
+        filesystem: APFS and Android storage treat paths that differ only in case,
+        or in NFC/NFD form, as one file, and casefolding alone can reintroduce
+        decomposed forms. SQLite's NOCASE and lower() fold ASCII only, so the
+        comparison happens here rather than in SQL.
         """
-        return unicodedata.normalize("NFC", str(Path(path))).casefold()
+        nfd = unicodedata.normalize("NFD", str(Path(path)))
+        return unicodedata.normalize("NFD", nfd.casefold())
 
     def get_post(self, post_id: str) -> sqlite3.Row | None:
         cur = self.db.execute("SELECT * FROM post WHERE post_id = ?", (post_id,))
