@@ -15,9 +15,9 @@ from ..errors import PreflightError
 def _temp_jar():
     """A 0600 temp file for a cookie jar, removed on exit."""
     fd, tmp = tempfile.mkstemp(prefix="patreon-archive-", suffix=".cookies.txt")
-    os.close(fd)
-    os.chmod(tmp, 0o600)
     try:
+        os.close(fd)
+        os.chmod(tmp, 0o600)
         yield tmp
     finally:
         try:

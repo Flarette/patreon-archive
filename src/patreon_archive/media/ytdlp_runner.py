@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
@@ -220,15 +220,18 @@ def download(url: str, cfg: Config, *, simulate: bool = False, hooks: list | Non
 
     Every call loads its own copy of the cookies file: yt-dlp writes the jar
     back when it closes, and under -j the posts would otherwise rewrite one
-    file while another is loading it.
+    file while another is loading it. The copy is of whatever file the merged
+    params name, so a passthrough --cookies is never written either.
     """
-    with private_copy(cfg.cookie_file) as jar_file:
-        return _download(url, replace(cfg, cookie_file=jar_file), simulate, hooks, claim)
-
-
-def _download(url: str, cfg: Config, simulate: bool, hooks: list | None,
-              claim: Callable[[str, str], bool] | None) -> Result:
     params = build_params(cfg, hooks)
+    with private_copy(params.get("cookiefile")) as jar_file:
+        if jar_file:
+            params["cookiefile"] = jar_file
+        return _download(url, params, simulate, claim)
+
+
+def _download(url: str, params: dict, simulate: bool,
+              claim: Callable[[str, str], bool] | None) -> Result:
     if simulate:
         params["simulate"] = True
         params["skip_download"] = True
