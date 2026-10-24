@@ -225,6 +225,18 @@ def test_second_recorded_legacy_owner_gets_its_own_file(patreon, media, legacy_p
     assert legacy_pair.read_bytes() == media["a"].read_bytes()
 
 
+def test_rerecorded_first_owner_keeps_the_name_from_the_legacy_row(patreon, media, legacy_pair):
+    """A row with a media id was written by a video that claimed the path, so it
+    outranks a legacy row whatever their insertion order."""
+    assert patreon.run(post_url("2202"), "--force").rc == 0
+
+    r = patreon.run(post_url("2201"), "--force")
+
+    assert r.rc == 0, r
+    assert r.files == ["Creator/Live [2201].mp4", "Creator/Live.mp4"]
+    assert media_rows(patreon, "2201") == [("2201", "Creator/Live [2201].mp4")]
+
+
 def test_long_creator_and_title_keep_the_suffix(patreon):
     # Past yt-dlp's 180-character trim of the rendered path, which would cut the
     # suffix off and send both posts to one file.

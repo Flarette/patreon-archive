@@ -185,14 +185,16 @@ class Store:
         """The video recorded as having completed `path`, or a case alias of it.
 
         Rows written before 0.4 carry no media id; their post id is the owner.
-        Should several rows claim one file, the first to record it wins: its
-        download is the one whose content is on disk. Whether the file is still
-        there does not matter: a recorded path stays its owner's.
+        A row with a media id was written by the video that claimed the path, so
+        it outranks them all. Among legacy rows sharing one file, the first to
+        record it wins: its download is the one whose content is on disk. Whether
+        the file is still there does not matter: a recorded path stays its owner's.
         """
         key = self.path_key(path)
         cur = self.db.execute(
             """SELECT COALESCE(media_id, post_id) AS owner, output_path FROM post_media
-               WHERE output_path IS NOT NULL AND state = 'complete' ORDER BY rowid"""
+               WHERE output_path IS NOT NULL AND state = 'complete'
+               ORDER BY media_id IS NULL, rowid"""
         )
         for row in cur:
             if self.path_key(row["output_path"]) == key:
