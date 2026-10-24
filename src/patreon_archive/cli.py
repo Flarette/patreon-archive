@@ -406,6 +406,11 @@ class _Claims:
             self._names[key] = video_id
             return True
 
+    def owner(self, path: str) -> str | None:
+        """The video recorded as having completed `path`, read under the lock."""
+        with self.lock:
+            return self.store.output_owner(path)
+
 
 def _persist(store: Store, res, pid: str, url: str) -> None:
     """Record the post under the requested id `pid`, and one media row per video."""
@@ -482,7 +487,8 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
         hooks.append(ev().hook(index or 0, post_id or url))
     # Not under the lock: yt-dlp calls the claim on this thread, and the claim
     # takes the lock, which is not reentrant.
-    res = ytdlp_runner.download(target, cfg, simulate=dry_run, hooks=hooks, claim=claims)
+    res = ytdlp_runner.download(target, cfg, simulate=dry_run, hooks=hooks, claim=claims,
+                                owner=claims.owner)
     pid = post_id or res.post_id or url
 
     if dry_run and res.outcome == Outcome.COMPLETE:

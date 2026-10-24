@@ -7,6 +7,8 @@ import subprocess
 
 import pytest
 
+from patreon_archive.errors import Outcome
+
 COLL = "https://www.patreon.com/collection/99"
 
 
@@ -81,3 +83,41 @@ def test_forced_run_staged_in_another_collections_folder_leaves_its_file(patreon
     assert r.files == ["First/Clip.mp4", "Second/Clip.mp4"]
     assert theirs.read_bytes() == before
     assert picture(patreon.out / "Second/Clip.mp4") == picture(media["c"])
+
+
+def test_output_inside_the_staging_folder_fails(patreon):
+    """A creator named like the default staging folder would put the post there."""
+    patreon.post("9101", "Clip", channel=".tmp")
+
+    r = patreon.run(post_url("9101"))
+
+    assert r.rc == 1, r
+    row = patreon.store().get_post("9101")
+    path = patreon.out / ".tmp/Clip.mp4"
+    assert (row["outcome"], row["outcome_detail"]) == (
+        Outcome.FAILED, f"output path is inside the staging folder: {path}")
+    assert [p for p in patreon.out.rglob("*")
+            if p.is_file() and not p.name.startswith(".patreon-archive.db")] == []
+
+
+def test_forced_run_leaves_an_earlier_output_in_the_staging_folder(patreon, media):
+    """An earlier run, staging elsewhere, recorded A where this run stages: B's
+    staging path is A's file."""
+    theirs = patreon.out / ".patreon-archive-tmp/Clip.mp4"
+    theirs.parent.mkdir(parents=True)
+    shutil.copyfile(media["a"], theirs)
+    store = patreon.store()
+    store.upsert_post(post_id="9201", outcome=Outcome.COMPLETE, tool_version="0.4.0",
+                      ytdlp_version="2026.07.04", title="Clip")
+    store.record_media(post_id="9201", source_kind="ytdlp_post_url", state="complete",
+                       media_id="9201", output_path=str(theirs))
+    patreon.collection("2", "Second", [("9202", "Clip")])
+
+    r = patreon.run(post_url("9202"), "--force", "--temp-dir", str(patreon.out))
+
+    assert r.rc == 1, r
+    row = patreon.store().get_post("9202")
+    assert (row["outcome"], row["outcome_detail"]) == (
+        Outcome.FAILED, f"staging path is another video's file: {theirs}")
+    assert theirs.read_bytes() == media["a"].read_bytes()
+    assert r.files == [".patreon-archive-tmp/Clip.mp4"]

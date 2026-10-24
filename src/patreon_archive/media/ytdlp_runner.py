@@ -13,6 +13,7 @@ from yt_dlp.utils import DownloadError, ExtractorError
 from ..auth.cookies import private_copy
 from ..config import Config, is_builtin_outtmpl
 from ..errors import Outcome
+from ..state.store import Store
 
 YTDLP_VERSION = yt_dlp.version.__version__
 
@@ -174,6 +175,40 @@ class _ClaimName(PostProcessor):
         return [], info
 
 
+class _OutsideStaging(PostProcessor):
+    """Keeps finished files out of staging, under any template.
+
+    A video's staging path is its final path re-rooted under staging, and yt-dlp
+    clears it before a forced download. So no final path may lie inside staging,
+    and no staging path may be a file recorded as another video's: --temp-dir can
+    change between runs, so an earlier run may have left one there. An unrecorded
+    file there is staging debris. Runs at the `video` stage after _ClaimName, so
+    the paths checked are the ones the download uses.
+    """
+
+    def __init__(self, owner: Callable[[str], str | None] | None):
+        super().__init__()
+        self._owner = owner
+
+    def run(self, info):
+        ydl = self._downloader
+        if not ydl.params.get("paths", {}).get("temp"):
+            return [], info
+        # DownloadErrors, as in _ClaimName, so the download step never runs.
+        path = ydl.prepare_filename(info)
+        if path and _inside(path, ydl.get_output_path("temp")):
+            raise DownloadError(f"output path is inside the staging folder: {path}")
+        staged = ydl.prepare_filename(info, "temp")
+        if staged and self._owner and self._owner(staged) not in (None, str(info["id"])):
+            raise DownloadError(f"staging path is another video's file: {staged}")
+        return [], info
+
+
+def _inside(path: str, folder: str) -> bool:
+    key = Store.path_key
+    return Path(key(Path(path).resolve())).is_relative_to(key(Path(folder).resolve()))
+
+
 class _Finished(PostProcessor):
     """Notes each video once it sits at its final path.
 
@@ -229,9 +264,11 @@ def classify_error(exc: Exception) -> Result:
 
 
 def download(url: str, cfg: Config, *, simulate: bool = False, hooks: list | None = None,
-             claim: Callable[[str, str], bool] | None = None) -> Result:
+             claim: Callable[[str, str], bool] | None = None,
+             owner: Callable[[str], str | None] | None = None) -> Result:
     """Download one post. `claim(video_id, path)` says whether the video may take
-    the title-only `path`; when it may not, the name gets " [<id>]".
+    the title-only `path`; when it may not, the name gets " [<id>]". `owner(path)`
+    names the video recorded as having completed `path`, if any.
 
     Each call loads its own private_copy of whatever cookies file the merged
     params name, so a passthrough --cookies is never written either.
@@ -240,11 +277,12 @@ def download(url: str, cfg: Config, *, simulate: bool = False, hooks: list | Non
     with private_copy(params.get("cookiefile")) as jar_file:
         if jar_file:
             params["cookiefile"] = jar_file
-        return _download(url, params, simulate, claim)
+        return _download(url, params, simulate, claim, owner)
 
 
 def _download(url: str, params: dict, simulate: bool,
-              claim: Callable[[str, str], bool] | None) -> Result:
+              claim: Callable[[str, str], bool] | None,
+              owner: Callable[[str], str | None] | None = None) -> Result:
     if simulate:
         params["simulate"] = True
         params["skip_download"] = True
@@ -257,6 +295,8 @@ def _download(url: str, params: dict, simulate: bool,
             ydl.add_post_processor(finished, when="after_move")
             if claim and not simulate and SUFFIX_FIELD in params["outtmpl"].get("default", ""):
                 ydl.add_post_processor(_ClaimName(claim), when="video")
+            if not simulate:
+                ydl.add_post_processor(_OutsideStaging(owner), when="video")
             info = ydl.extract_info(url, download=not simulate)
     except (DownloadError, ExtractorError) as exc:
         res = classify_error(exc)
