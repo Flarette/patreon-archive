@@ -10,6 +10,7 @@ import queue
 import re
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import yt_dlp
@@ -439,44 +440,57 @@ def _persist(store: Store, res, pid: str, url: str, dry_run: bool) -> None:
 
 
 def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
-              collect: list[Path] | None = None, claims: _Claims | None = None) -> Outcome:
+              collect: list[Path] | None = None, claims: _Claims | None = None, *,
+              index: int | None = None, hooks: list | None = None,
+              log: Callable[..., None] | None = None) -> Outcome:
     """Download a single post URL and record its outcome. Never raises.
 
-    `collect` gathers the files this run actually produced, for -a. `claims` is
-    the run's name registry; a single-post run gets its own.
+    The one per-post body, for a single post, the serial loop and every -j
+    worker alike. `collect` gathers the files this run actually produced, for
+    -a. `claims` is the run's name registry; a single-post run gets its own,
+    and its lock guards every store access here. Under -j the caller passes the
+    entry's `index`, its progress row's `hooks`, and `log(msg, err=False)`, the
+    sink for human lines.
     """
+    claims = claims or _Claims(store)
+    if log is None:
+        def log(msg: str, err: bool = False) -> None:
+            _out(msg, cfg, err=err)
+    # Under -j lines from several posts interleave, so each names its entry.
+    at = f"[{index}] " if index is not None else ""
+    numbered = {"index": index} if index is not None else {}
+
     post_id = extract_post_id(url)
     if post_id:
-        proceed, why = store.should_process(
-            post_id, force=cfg.force, tool_version=__version__
-        )
+        with claims.lock:
+            proceed, why = store.should_process(post_id, force=cfg.force)
         if not proceed:
-            ev().emit("post_skipped", post_id=post_id, reason=why)
-            _out(f"skip {post_id}: {why}", cfg)
+            ev().emit("post_skipped", **numbered, post_id=post_id, reason=why)
+            log(f"skip {at}{post_id}: {why}")
             return Outcome.COMPLETE
 
     # Hand yt-dlp the canonical URL. Share links and tracking params ride along
     # otherwise, and extractor URL matching is sensitive to them.
     target = post_url(post_id) if post_id else url
 
-    ev().emit("post_start", post_id=post_id, url=target)
-    res = ytdlp_runner.download(
-        target, cfg,
-        simulate=dry_run,
-        hooks=[ev().hook(0, post_id or url)] if cfg.agent else None,
-        claim=claims or _Claims(store),
-    )
+    ev().emit("post_start", **numbered, post_id=post_id, url=target)
+    hooks = list(hooks or [])
+    if cfg.agent:
+        hooks.append(ev().hook(index or 0, post_id or url))
+    # Not under the lock: the claim takes it from yt-dlp's thread.
+    res = ytdlp_runner.download(target, cfg, simulate=dry_run, hooks=hooks, claim=claims)
     pid = post_id or res.post_id or url
 
     if dry_run:
-        ev().emit("post_would_download", post_id=pid, title=res.title)
-        _out(f"would download: {res.title or '?'}  [{pid}]", cfg)
+        ev().emit("post_would_download", **numbered, post_id=pid, title=res.title)
+        log(f"would download: {res.title or '?'}  {at}[{pid}]")
         return res.outcome
 
-    _persist(store, res, pid, url, dry_run)
+    with claims.lock:
+        _persist(store, res, pid, url, dry_run)
 
     ev().emit(
-        "post_done", post_id=pid, outcome=str(res.outcome), title=res.title,
+        "post_done", **numbered, post_id=pid, outcome=str(res.outcome), title=res.title,
         path=str(res.filepath) if res.filepath else None,
         bytes=res.filepath.stat().st_size if (res.filepath and res.filepath.exists()) else None,
         detail=res.detail,
@@ -484,15 +498,16 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
     if res.outcome == Outcome.COMPLETE:
         for v in res.videos:
             if collect is not None:
-                collect.append(v.filepath)
+                with claims.lock:
+                    collect.append(v.filepath)
             mb = v.filepath.stat().st_size / (1024 * 1024)
-            _out(f"  ok  {v.filepath.name}  ({mb:.1f} MiB)", cfg)
+            log(f"  ok  {at}{v.filepath.name}  ({mb:.1f} MiB)")
     elif res.outcome == Outcome.NO_ACCESS:
-        _out(f"  no access  [{pid}] {res.detail}", cfg, err=True)
+        log(f"  no access  {at}[{pid}] {res.detail}", err=True)
     elif res.outcome == Outcome.INDETERMINATE:
-        _out(f"  indeterminate  [{pid}] {res.detail} (will retry on re-run)", cfg, err=True)
+        log(f"  indeterminate  {at}[{pid}] {res.detail} (will retry on re-run)", err=True)
     else:
-        _out(f"  failed  [{pid}] {res.detail}", cfg, err=True)
+        log(f"  failed  {at}[{pid}] {res.detail}", err=True)
     return res.outcome
 
 
@@ -685,51 +700,27 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
               claims: _Claims | None = None) -> None:
     """Run N posts at once, each owning one live progress row.
 
-    Store access is serialised on the name registry's lock: sqlite3 connections
-    are not thread-safe, and the registry reads the store from yt-dlp's threads.
+    Every worker shares one name registry, whose lock `_one_post` holds for
+    store access: sqlite3 connections are not thread-safe, and the registry
+    reads the store from yt-dlp's threads.
     """
     slots = min(cfg.concurrency, len(chosen))
     free: queue.Queue[int] = queue.Queue()
     for i in range(slots):
         free.put(i)
     claims = claims or _Claims(store)
-    store_lock = claims.lock
 
     with MultilineProgress(slots) as ui:
+        def log(msg: str, err: bool = False) -> None:
+            ui.log(msg)  # already stderr, with the rows
+
         def work(n: int, pid: str) -> Outcome:
             slot = free.get()
             label = f"[{n}] {(labels or {}).get(pid) or pid}"
             try:
                 ui.set(slot, f"  {label:38.38} starting…")
-                ev().emit("post_start", index=n, post_id=pid, url=post_url(pid))
-                hooks = [ui.hook(slot, label)]
-                if cfg.agent:
-                    hooks.append(ev().hook(n, pid))
-                res = ytdlp_runner.download(
-                    post_url(pid), cfg, simulate=a.dry_run, hooks=hooks, claim=claims,
-                )
-                with store_lock:
-                    _persist(store, res, pid, post_url(pid), a.dry_run)
-                ev().emit(
-                    "post_done", index=n, post_id=pid, outcome=str(res.outcome),
-                    title=res.title,
-                    path=str(res.filepath) if res.filepath else None,
-                    bytes=res.filepath.stat().st_size
-                    if (res.filepath and res.filepath.exists()) else None,
-                    detail=res.detail,
-                )
-                if res.outcome == Outcome.COMPLETE and res.videos:
-                    for v in res.videos:
-                        if produced is not None:
-                            with store_lock:
-                                produced.append(v.filepath)
-                        mb = v.filepath.stat().st_size / (1024 * 1024)
-                        ui.log(f"  ok  [{n}] {v.filepath.name}  ({mb:.1f} MiB)")
-                elif a.dry_run:
-                    ui.log(f"  would download  [{n}] {res.title or pid}")
-                else:
-                    ui.log(f"  {res.outcome}  [{n}] {res.detail}")
-                return res.outcome
+                return _one_post(cfg, store, post_url(pid), a.dry_run, produced, claims,
+                                 index=n, hooks=[ui.hook(slot, label)], log=log)
             finally:
                 ui.set(slot, "")
                 free.put(slot)

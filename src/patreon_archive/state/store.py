@@ -67,8 +67,12 @@ class Store:
         cur = self.db.execute("SELECT * FROM post WHERE post_id = ?", (post_id,))
         return cur.fetchone()
 
-    def should_process(self, post_id: str, *, force: bool, tool_version: str) -> tuple[bool, str]:
-        """Invalidation rule. Returns (process?, reason)."""
+    def should_process(self, post_id: str, *, force: bool) -> tuple[bool, str]:
+        """Invalidation rule. Returns (process?, reason).
+
+        A new tool version alone never reopens a complete post; `force` is the
+        switch for that.
+        """
         row = self.get_post(post_id)
         if force:
             return True, "forced"
@@ -78,8 +82,6 @@ class Store:
             return True, f"previous outcome {row['outcome']}"
         if row["outcome"] == Outcome.NO_ACCESS:
             return True, "re-checking access"
-        if row["tool_version"] != tool_version:
-            return True, "tool version changed"
         # complete: verify the recorded outputs still exist before trusting it
         missing = [
             r["output_path"]
