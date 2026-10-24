@@ -142,6 +142,7 @@ EXIT_FAILED = 1
 EXIT_NO_ACCESS = 2
 EXIT_INDETERMINATE = 3
 EXIT_PREFLIGHT = 4
+EXIT_INTERRUPTED = 130  # 128 + SIGINT, as a shell reports Ctrl-C
 
 _EXIT = {
     Outcome.COMPLETE: EXIT_OK,
@@ -299,16 +300,25 @@ Emits one JSON object per line on stdout, flushed immediately. Human text is
 diverted to stderr so stdout stays a clean data channel. Run it backgrounded and
 tail stdout.
 
-  run_start          kind, collection_id, title, total, selected, concurrency, post_ids
-  collection_listed  entries[] of {index, post_id, url}   (with --list)
-  post_start         index, post_id, url
-  progress           index, post_id, percent, downloaded_bytes, total_bytes,
-                     speed_bps, eta_s, fragment, fragment_count   (throttled ~2s)
-  post_downloaded    index, post_id, note=muxing
-  post_done          index, post_id, outcome, title, path, bytes, detail
-  run_done           summary{outcome: count}, selected, exit_code
+  run_start            kind, collection_id, title, total, selected, concurrency,
+                       post_ids
+  collection_listed    entries[] of {index, post_id, url}   (with --list)
+  post_start           index, post_id, url
+  post_skipped         index, post_id, reason   (already complete)
+  post_would_download  index, post_id, title   (with --dry-run)
+  progress             index, post_id, percent, downloaded_bytes, total_bytes,
+                       speed_bps, eta_s, fragment, fragment_count
+                       (throttled ~2s)
+  post_downloaded      index, post_id, note=muxing
+  post_done            index, post_id, outcome, title, path, bytes, detail
+  run_done             summary{outcome: count}, selected, exit_code
 
-Exit codes: 0 complete, 1 failed, 2 no_access, 3 indeterminate, 4 preflight error.
+index is the entry's number as --list prints it (1 = oldest), present for
+collection entries. For a single post, progress and post_downloaded carry
+index 0 and the other post_* events have none. A dry run emits post_done for a
+post it cannot resolve, as a real run would, and post_would_download otherwise.
+
+Exit codes: 0 complete, 1 failed, 2 no_access, 3 indeterminate, 4 preflight error, 130 interrupted.
 
 Example:
   patreon-archive get URL -I 1-5 -j 3 --agent > events.jsonl 2> run.log &
@@ -636,6 +646,7 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
     store = Store(cfg.state_db)
     claims = _Claims(store)
     lock = threading.Lock()
+    interrupted = False
 
     def record(outcome: Outcome) -> None:
         with lock:
@@ -643,7 +654,7 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
 
     try:
         if cfg.concurrency > 1:
-            _parallel(cfg, store, chosen, a, record, produced, labels, claims)
+            interrupted = _parallel(cfg, store, chosen, a, record, produced, labels, claims)
         else:
             for n, pid in chosen:
                 _out(f"[{n}/{total}] {labels.get(pid) or f'post {pid}'}", cfg)
@@ -652,6 +663,7 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
                                         claims, index=n)
                 except KeyboardInterrupt:
                     print("\ninterrupted", file=sys.stderr)
+                    interrupted = True
                     break
                 except Exception as exc:  # noqa: BLE001
                     outcome = Outcome.FAILED
@@ -662,11 +674,18 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
     finally:
         store.close()
 
-    code = EXIT_OK
-    if tally.get(Outcome.FAILED):
+    # D7. no_access decides the code only when nothing completed: a selection
+    # that mixes in a few locked posts still did its job.
+    if interrupted:
+        code = EXIT_INTERRUPTED
+    elif tally.get(Outcome.FAILED):
         code = EXIT_FAILED
     elif tally.get(Outcome.INDETERMINATE):
         code = EXIT_INDETERMINATE
+    elif tally.get(Outcome.NO_ACCESS) and not tally.get(Outcome.COMPLETE):
+        code = EXIT_NO_ACCESS
+    else:
+        code = EXIT_OK
 
     ev().emit("run_done", summary={str(k): v for k, v in tally.items()},
               selected=len(chosen), exit_code=code)
@@ -675,7 +694,9 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
         if tally.get(oc):
             _out(f"  {oc:16} {tally[oc]}", cfg)
 
-    _maybe_archive(cfg, a, produced)
+    # An interrupted run is not the set the user asked to pack.
+    if not interrupted:
+        _maybe_archive(cfg, a, produced)
     return code
 
 
@@ -700,12 +721,13 @@ def _maybe_archive(cfg: Config, a: argparse.Namespace, produced: list[Path]) -> 
 def _parallel(cfg: Config, store: Store, chosen, a, record,
               produced: list[Path] | None = None,
               labels: dict[str, str | None] | None = None,
-              claims: _Claims | None = None) -> None:
+              claims: _Claims | None = None) -> bool:
     """Run N posts at once, each owning one live progress row.
 
     Every worker shares one name registry, whose lock `_one_post` holds for
     store access: sqlite3 connections are not thread-safe, and the registry
-    reads the store from yt-dlp's threads.
+    reads the store from yt-dlp's threads. Returns whether Ctrl-C cut the run
+    short; posts in flight then finish first, and queued ones are cancelled.
     """
     slots = min(cfg.concurrency, len(chosen))
     free: queue.Queue[int] = queue.Queue()
@@ -742,7 +764,8 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
                 # Let in-flight muxes finish rather than corrupting outputs.
                 ui.log("interrupted; letting in-flight downloads finish…")
                 pool.shutdown(wait=True, cancel_futures=True)
-                raise
+                return True
+    return False
 
 
 def cmd_status(cfg: Config, post: str | None) -> int:
@@ -830,7 +853,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_PREFLIGHT
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
-        return EXIT_FAILED
+        return EXIT_INTERRUPTED
     return EXIT_FAILED
 
 
