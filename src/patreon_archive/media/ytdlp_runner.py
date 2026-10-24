@@ -10,7 +10,7 @@ import yt_dlp
 from yt_dlp.postprocessor import PostProcessor
 from yt_dlp.utils import DownloadError, ExtractorError
 
-from ..config import Config
+from ..config import Config, is_builtin_outtmpl
 from ..errors import Outcome
 
 YTDLP_VERSION = yt_dlp.version.__version__
@@ -38,7 +38,8 @@ class Result:
     outcome: Outcome
     detail: str | None = None
     title: str | None = None
-    # Always the post's own id, never a multi-video entry id.
+    # The extractor's top-level id, which for an embed can be the provider's;
+    # never a multi-video entry id. State is stored under the requested id (D2).
     post_id: str | None = None
     uploader: str | None = None
     duplicate_of: Path | None = None
@@ -83,7 +84,6 @@ def build_params(cfg: Config, hooks: list | None = None) -> dict:
     params: dict = {
         "paths": {"home": str(cfg.archive_root), "temp": str(cfg.temp_dir)},
         "outtmpl": {"default": cfg.outtmpl},
-        "trim_file_name": 180,
         "windowsfilenames": False,
         "writeinfojson": cfg.write_infojson,
         "writethumbnail": cfg.write_thumbnails,
@@ -122,6 +122,11 @@ def build_params(cfg: Config, hooks: list | None = None) -> dict:
     if hooks:
         params["progress_hooks"] = hooks
     params.update(cfg.extra_ytdlp)
+    # Our templates bound each path segment themselves; trimming the rendered
+    # path would cut a suffix off and merge two names into one. A user template
+    # has no such bound, so it keeps the trim.
+    if not is_builtin_outtmpl(params["outtmpl"].get("default", "")):
+        params.setdefault("trim_file_name", 180)
     return params
 
 
@@ -137,10 +142,19 @@ class _ClaimName(PostProcessor):
         self._claim = claim
 
     def run(self, info):
+        vid = str(info["id"])
         # pa_suffix is still unset, so this renders the title-only path.
         path = self._downloader.prepare_filename(info)
-        if path and not self._claim(str(info["id"]), path):
-            info["pa_suffix"] = f" [{info['id']}]"
+        if not path or self._claim(vid, path):
+            return [], info
+        info["pa_suffix"] = f" [{vid}]"
+        alt = self._downloader.prepare_filename(info)
+        if alt == path or not self._claim(vid, alt):
+            # Never fall back onto a file that is someone else's. Not a
+            # PostProcessingError: yt-dlp only logs that one here, runs the
+            # download step anyway, and raises it after (never, with
+            # --ignore-errors).
+            raise DownloadError(f"no free name for {vid}: {alt} is taken")
         return [], info
 
 
@@ -236,22 +250,30 @@ def _result(info: dict | None, simulate: bool) -> Result:
         return Result(Outcome.INDETERMINATE, detail="extractor returned no info")
 
     multi = info.get("_type") == "playlist"
-    entries = [e for e in (info.get("entries") or []) if e] if multi else [info]
+    entries = list(info.get("entries") or []) if multi else [info]
     if not entries:
         return Result(Outcome.INDETERMINATE, detail="playlist with no entries")
 
+    pid = str(info.get("id") or "")
+    first = next((e for e in entries if e), {})
     meta = Result(
         Outcome.COMPLETE,
-        title=info.get("title") or entries[0].get("title"),
-        post_id=str(info.get("id") or ""),
+        title=info.get("title") or first.get("title"),
+        post_id=pid,
         uploader=(info.get("channel") or info.get("uploader")
-                  or entries[0].get("channel") or entries[0].get("uploader")),
+                  or first.get("channel") or first.get("uploader")),
     )
     if simulate:
         meta.detail = "simulated"
         return meta
 
-    meta.videos = [_judge(str(e.get("id") or ""), _final_path(e)) for e in entries]
+    # yt-dlp leaves None where an entry failed under --ignore-errors; that video
+    # is missing, and the post is not complete without it.
+    meta.videos = [
+        _judge(str(e.get("id") or ""), _final_path(e)) if e
+        else Video(f"{pid}-{n}", Outcome.FAILED, None, "video missing from the extraction result")
+        for n, e in enumerate(entries, 1)
+    ]
     # Complete only when every video is (D3); otherwise the worst of them.
     bad = [v for v in meta.videos if v.outcome != Outcome.COMPLETE]
     if bad:

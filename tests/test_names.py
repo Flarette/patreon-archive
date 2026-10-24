@@ -185,3 +185,87 @@ def test_legacy_row_keeps_its_name_and_is_replaced(patreon, media):
     assert r.files == ["Creator/Legacy.mp4"]
     rows = patreon.store().media_for("601")
     assert [(m["media_id"], m["dedup_key"]) for m in rows] == [("601", "601")]
+
+
+def test_long_creator_and_title_keep_the_suffix(patreon):
+    # Past yt-dlp's 180-character trim of the rendered path, which would cut the
+    # suffix off and send both posts to one file.
+    creator, title = "C" * 120, "T" * 160
+    patreon.post("2001", title, channel=creator, upload_date="20240101")
+    patreon.post("2002", title, channel=creator, upload_date="20240202")
+
+    first = patreon.run(post_url("2001"))
+    r = patreon.run(post_url("2002"))
+
+    assert first.rc == 0, first
+    assert r.rc == 0, r
+    folder, name = creator[:100], title[:150]
+    assert r.files == [f"{folder}/{name} [2002].mp4", f"{folder}/{name}.mp4"]
+    assert date_tag(patreon.out / folder / f"{name}.mp4") == "20240101"
+
+
+def test_taken_suffixed_name_fails_the_video(patreon):
+    patreon.post("1", "Clip", media="a")
+    patreon.post("3", "Clip [2]", media="c")
+    patreon.post("2", "Clip", media="b")
+    assert patreon.run(post_url("1")).rc == 0
+    assert patreon.run(post_url("3")).rc == 0
+    theirs = patreon.out / "Creator/Clip [2].mp4"
+    before = theirs.read_bytes()
+
+    r = patreon.run(post_url("2"))
+
+    assert r.rc == 1, r
+    assert f"no free name for 2: {theirs} is taken" in r.err
+    assert patreon.store().get_post("2")["outcome"] == Outcome.FAILED
+    assert media_rows(patreon, "2") == [(None, None)]
+    assert media_rows(patreon, "3") == [("3", "Creator/Clip [2].mp4")]
+    assert theirs.read_bytes() == before
+    assert r.files == ["Creator/Clip [2].mp4", "Creator/Clip.mp4"]
+
+
+def test_names_differing_only_in_case_get_their_own_files_in_parallel(patreon):
+    patreon.post("701", "Clip", media="a")
+    patreon.post("702", "clip", media="b")
+    patreon.collection("89", "Cases", [("701", "Clip"), ("702", "clip")])
+
+    r = patreon.run("https://www.patreon.com/collection/89", "-i", "1-2", "-j", "2")
+
+    assert r.rc == 0, r
+    paths = {}
+    for pid in ("701", "702"):
+        [(media_id, path)] = media_rows(patreon, pid)
+        assert media_id == pid
+        paths[pid] = path
+    assert r.files == sorted(paths.values())
+    # Which one wins the title-only name is a race; that one is suffixed is not.
+    assert sorted(path.endswith(f" [{pid}].mp4") for pid, path in paths.items()) == [False, True]
+
+
+def test_multi_video_post_with_a_missing_entry_resumes(patreon):
+    patreon.post("3003", "Episode 7", videos=["a", "b"])
+
+    def lose_second(ydl, info, download):
+        # Only the first video is processed; the second is left as None, as
+        # yt-dlp leaves an entry whose extraction failed under --ignore-errors.
+        del info["entries"][1]
+        res = ydl.process_ie_result(info, download=download)
+        res["entries"].append(None)
+        return res
+
+    patreon.on_extract["3003"] = lose_second
+
+    first = patreon.run(post_url("3003"))
+
+    assert first.rc == 1, first
+    assert patreon.store().get_post("3003")["outcome"] == Outcome.FAILED
+    assert media_rows(patreon, "3003") == [("3003-1", "Creator/Episode 7.mp4"),
+                                           ("3003-2", None)]
+
+    del patreon.on_extract["3003"]
+    r = patreon.run(post_url("3003"))
+
+    assert r.rc == 0, r
+    assert patreon.extract_calls == ["3003", "3003"]
+    assert r.files == ["Creator/Episode 7 [3003-2].mp4", "Creator/Episode 7.mp4"]
+    assert patreon.store().get_post("3003")["outcome"] == Outcome.COMPLETE

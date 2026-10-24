@@ -9,9 +9,22 @@ from pathlib import Path
 # title-only name is already taken; ytdlp_runner sets it, and unset it renders
 # empty. `--keep-id` always carries the id instead.
 # Posts that belong to a collection drop CREATOR_DIR and sit flat in its folder.
-CREATOR_DIR = "%(channel,uploader,extractor)s/"
+# Every segment is byte-bounded here (creator 100 B, title 150 B plus suffix and
+# extension), so these never need yt-dlp's trim_file_name, which cuts the whole
+# rendered path and would cut the suffix off with it.
+CREATOR_DIR = "%(channel,uploader,extractor).100B/"
 DEFAULT_OUTTMPL = CREATOR_DIR + "%(title).150B%(pa_suffix|)s.%(ext)s"
 OUTTMPL_WITH_ID = CREATOR_DIR + "%(title).150B [%(id)s].%(ext)s"
+
+_BUILTIN_OUTTMPLS = frozenset(
+    t for base in (DEFAULT_OUTTMPL, OUTTMPL_WITH_ID)
+    for t in (base, base.removeprefix(CREATOR_DIR))
+)
+
+
+def is_builtin_outtmpl(tmpl: str) -> bool:
+    """Whether `tmpl` is one of ours, in its creator or its collection form."""
+    return tmpl in _BUILTIN_OUTTMPLS
 
 
 @dataclass(frozen=True)
