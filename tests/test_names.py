@@ -243,8 +243,8 @@ CUSTOM = ("--outtmpl", "%(channel)s/%(title)s.%(ext)s")
 
 
 def test_custom_template_reuse_does_not_take_a_legacy_owners_file(patreon, legacy_pair):
-    """A user template never claims a name, so yt-dlp's reuse of the shared file
-    records it without outranking the post whose download the file holds."""
+    """A user template never claims a name, so its forced run writes over the
+    shared file and records it, without outranking the post that recorded it first."""
     assert patreon.run(post_url("2201"), *CUSTOM, "--force").rc == 0
 
     r = patreon.run(post_url("2202"), "--force")
@@ -383,7 +383,7 @@ def test_moved_away_file_still_owns_its_case_alias(patreon, theirs, mine):
     assert media_rows(patreon, "1") == [("1", f"Creator/{theirs}.mp4")]
 
 
-def test_title_case_change_keeps_the_recorded_file(patreon):
+def test_title_case_change_reuses_the_recorded_name(patreon):
     post = patreon.post("501", "Clip")
     assert patreon.run(post_url("501")).rc == 0
     post.title = "clip"
@@ -392,8 +392,8 @@ def test_title_case_change_keeps_the_recorded_file(patreon):
 
     assert r.rc == 0, r
     assert not any("[501]" in f for f in r.files), r.files
+    assert media_rows(patreon, "501") == [("501", "Creator/clip.mp4")]
     if (patreon.out / "Creator/CLIP.mp4").exists():
-        # Case-insensitive storage: the alias is the recorded file, so nothing
-        # is fetched again.
-        assert r.files == ["Creator/Clip.mp4"]
-        assert "has already been downloaded" in r.out
+        # Case-insensitive storage: the alias is the post's own recorded file,
+        # so --force replaces it, under the new title's case.
+        assert r.files == ["Creator/clip.mp4"]

@@ -126,6 +126,17 @@ def build_params(cfg: Config, hooks: list | None = None) -> dict:
         ]
     if hooks:
         params["progress_hooks"] = hooks
+    if cfg.force:
+        # yt-dlp keeps a file already at the output path ("has already been
+        # downloaded"), so --force would fetch again and leave the old content.
+        # Under the default template the claim still picks the name, so only
+        # the video's own file is replaced; a user template's path is the
+        # user's. A stale .part from an interrupted earlier download is not
+        # resumed either, as yt-dlp's own --force-overwrites implies
+        # (yt_dlp/__init__.py:587). Set before the merge, so a passthrough -w
+        # or --force-overwrites wins.
+        params["overwrites"] = True
+        params["continuedl"] = False
     params.update(cfg.extra_ytdlp)
     # Only a user template keeps the trim: ours bound each segment instead, and
     # trimming the rendered path would cut the suffix off (config.py).
@@ -275,18 +286,22 @@ def _result(info: dict | None, simulate: bool) -> Result:
         uploader=(info.get("channel") or info.get("uploader")
                   or first.get("channel") or first.get("uploader")),
     )
-    if simulate:
-        meta.detail = "simulated"
-        return meta
-
     # yt-dlp leaves None where an entry failed under --ignore-errors
     # (YoutubeDL.__process_playlist, YoutubeDL.py:2181); that video is missing,
-    # and the post is not complete without it.
-    meta.videos = [
-        _judge(str(e.get("id") or ""), _final_path(e)) if e
-        else Video(f"{pid}-{n}", Outcome.FAILED, None, "video missing from the extraction result")
-        for n, e in enumerate(entries, 1)
-    ]
+    # and the post is not complete without it, in a dry run too.
+    missing = {n: Video(f"{pid}-{n}", Outcome.FAILED, None,
+                        "video missing from the extraction result")
+               for n, e in enumerate(entries, 1) if not e}
+    if simulate:
+        if not missing:
+            meta.detail = "simulated"
+            return meta
+        # Nothing was downloaded, so the missing videos are all there is to judge.
+        meta.videos = list(missing.values())
+    else:
+        meta.videos = [missing[n] if n in missing
+                       else _judge(str(e.get("id") or ""), _final_path(e))
+                       for n, e in enumerate(entries, 1)]
     bad = [v for v in meta.videos if v.outcome != Outcome.COMPLETE]
     if bad:
         worst = next((v for v in bad if v.outcome == Outcome.FAILED), bad[0])

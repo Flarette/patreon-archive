@@ -666,31 +666,32 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
 
     try:
         with _sigint_watch() as sigint:
-            try:
-                _out(f"{label}: {total} posts, selected {len(chosen)}"
-                     f"{f', {cfg.concurrency} at a time' if cfg.concurrency > 1 else ''}\n"
-                     f"  -> {cfg.archive_root}\n", cfg)
-                if cfg.concurrency > 1:
-                    interrupted = _parallel(cfg, store, chosen, a, record, produced,
-                                            labels, claims, sigint)
-                else:
-                    for n, pid in chosen:
-                        if sigint.is_set():
-                            break
-                        _out(f"[{n}/{total}] {labels.get(pid) or f'post {pid}'}", cfg)
-                        try:
-                            outcome = _one_post(cfg, store, post_url(pid), a.dry_run,
-                                                produced, claims, index=n)
-                        except Exception as exc:  # noqa: BLE001
-                            outcome = Outcome.FAILED
-                            print(f"  failed  [{pid}] {type(exc).__name__}: {exc}",
-                                  file=sys.stderr)
-                        record(outcome)
-                        if outcome != Outcome.COMPLETE and not a.continue_on_error:
-                            break
-            except KeyboardInterrupt:
-                interrupted = True
+            _out(f"{label}: {total} posts, selected {len(chosen)}"
+                 f"{f', {cfg.concurrency} at a time' if cfg.concurrency > 1 else ''}\n"
+                 f"  -> {cfg.archive_root}\n", cfg)
+            if cfg.concurrency > 1:
+                interrupted = _parallel(cfg, store, chosen, a, record, produced,
+                                        labels, claims, sigint)
+            else:
+                for n, pid in chosen:
+                    if sigint.is_set():
+                        break
+                    _out(f"[{n}/{total}] {labels.get(pid) or f'post {pid}'}", cfg)
+                    try:
+                        outcome = _one_post(cfg, store, post_url(pid), a.dry_run,
+                                            produced, claims, index=n)
+                    except Exception as exc:  # noqa: BLE001
+                        outcome = Outcome.FAILED
+                        print(f"  failed  [{pid}] {type(exc).__name__}: {exc}",
+                              file=sys.stderr)
+                    record(outcome)
+                    if outcome != Outcome.COMPLETE and not a.continue_on_error:
+                        break
             interrupted = interrupted or sigint.is_set()
+    except KeyboardInterrupt:
+        # Outside the watch, so a Ctrl-C as its handler goes in or comes back out
+        # still ends the run as interrupted, not through main().
+        interrupted = True
     finally:
         store.close()
     if interrupted:

@@ -237,27 +237,40 @@ def test_ignored_ctrl_c_stays_ignored(patreon, sigint_restored):
     assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
 
 
-def test_ctrl_c_just_after_the_handler_goes_in_still_restores_it(patreon, sigint_restored,
-                                                                 monkeypatch):
+@pytest.mark.parametrize(("call", "extracted", "summary"), [
+    (1, [], {}),
+    (2, ["7001", "7002", "7003"], {"complete": 3}),
+], ids=["going-in", "coming-out"])
+def test_ctrl_c_as_the_handler_goes_in_or_out(patreon, sigint_restored, monkeypatch,
+                                              call, extracted, summary):
+    """Ctrl-C lands right after the run's handler goes in, or right after the
+    previous one is put back. The handler is still restored, and the run still
+    ends as an interrupted one: summary, run_done with 130, and no archive.
+    """
     patreon.collection("44", "Run", ENTRIES)
     install = signal.signal
     landed = []
 
     def install_then_interrupt(signum, handler):
         previous = install(signum, handler)
-        if not landed:
-            landed.append(handler)
+        landed.append(handler)
+        if len(landed) == call:
             raise KeyboardInterrupt
         return previous
 
     monkeypatch.setattr(signal, "signal", install_then_interrupt)
 
-    r = patreon.run(COLL)
+    r = patreon.run(COLL, "-a", "zip", "--agent")
 
     assert r.rc == 130, r
-    assert len(landed) == 1
+    assert len(landed) == 2
     assert signal.getsignal(signal.SIGINT) is sigint_restored
-    assert patreon.extract_calls == []
+    assert patreon.extract_calls == extracted
+    events = [json.loads(line) for line in r.out.splitlines()]
+    assert [(e["summary"], e["exit_code"]) for e in events
+            if e["event"] == "run_done"] == [(summary, 130)]
+    assert "\nsummary\n" in r.err
+    assert not [f for f in r.files if f.endswith(".zip")]
 
 
 def test_collection_runs_off_the_main_thread(patreon, sigint_restored):

@@ -65,3 +65,30 @@ def test_serial_events_carry_the_entry_index(mixed):
         ("post_start", 3), ("post_done", 3),
     ]
 
+
+
+def test_dry_run_of_a_post_missing_a_video_reports_it_failed(patreon):
+    patreon.post("6100", "Episode", videos=["a", "b"])
+
+    def lose_second(ydl, info, download):
+        # The second video is left as None, as yt-dlp leaves an entry whose
+        # extraction failed under --ignore-errors.
+        del info["entries"][1]
+        res = ydl.process_ie_result(info, download=download)
+        res["entries"].append(None)
+        return res
+
+    patreon.on_extract["6100"] = lose_second
+
+    r = patreon.run("https://www.patreon.com/posts/6100", "-n", "--agent")
+
+    assert r.rc == 1, r
+    events = [json.loads(line) for line in r.out.splitlines()]
+    assert [(e["event"], e.get("outcome"), e.get("detail")) for e in events
+            if e["event"] in ("post_done", "post_would_download")] == [
+        ("post_done", "failed", "6100-2: video missing from the extraction result"),
+    ]
+    store = patreon.store()
+    assert store.summary() == []
+    assert store.media_for("6100") == []
+    assert r.files == []
