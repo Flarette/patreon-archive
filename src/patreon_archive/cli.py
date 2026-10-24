@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import dataclasses
 import datetime
 import os
@@ -19,7 +20,7 @@ from .api.client import PatreonApi, post_url
 from .archive import FORMATS as ARCHIVE_FORMATS, make_archive
 from .auth import preflight
 from .auth.cookies import materialized_jar
-from .config import Config, DEFAULT_OUTTMPL, OUTTMPL_WITH_ID, parse_browser_spec
+from .config import CREATOR_DIR, Config, DEFAULT_OUTTMPL, OUTTMPL_WITH_ID, parse_browser_spec
 from .errors import Outcome, PatreonArchiveError
 from .events import Emitter, ev, set_emitter
 from .media import ytdlp_runner
@@ -63,6 +64,52 @@ def _folder_name(label: str) -> str:
     """Collection title -> one safe path segment."""
     name = sanitize_filename(label, restricted=False).strip(" .")
     return name[:120] or "collection"
+
+
+def _in_collection(cfg: Config, a: argparse.Namespace, label: str) -> Config:
+    """Send downloads flat into <dest>/<collection>/.
+
+    The creator level comes off the template: a collection is one creator's, so it
+    would only nest every file a folder deeper. An explicit --outtmpl is left alone.
+    State and temp stay at the root: the db is what makes re-runs resume, and it is
+    per-destination, not per-folder.
+    """
+    tmpl = cfg.outtmpl if a.outtmpl else cfg.outtmpl.removeprefix(CREATOR_DIR)
+    return dataclasses.replace(cfg, archive_root=cfg.archive_root / _folder_name(label),
+                               outtmpl=tmpl)
+
+
+@contextlib.contextmanager
+def _api(cfg: Config):
+    params = {"quiet": True, "no_warnings": True}
+    if cfg.browser_spec:
+        params["cookiesfrombrowser"] = cfg.browser_spec
+    if cfg.cookie_file:
+        params["cookiefile"] = cfg.cookie_file
+    with yt_dlp.YoutubeDL(params) as ydl:
+        yield PatreonApi(ydl, request_sleep=cfg.request_sleep)
+
+
+def _post_folder(cfg: Config, a: argparse.Namespace, post_id: str) -> Config:
+    """A single post that belongs to a collection lands where the collection would put it.
+
+    The lookup only picks a folder, so a failure falls back to the creator folder
+    rather than costing the download.
+    """
+    try:
+        with _api(cfg) as api:
+            colls = api.post_collections(post_id)
+    except (PatreonArchiveError, ValueError) as exc:
+        _out(f"collection lookup failed, saving under the creator folder: {exc}", cfg, err=True)
+        return cfg
+    if not colls:
+        return cfg
+    cid, title = colls[0]
+    label = title or f"collection {cid}"
+    also = f"  (also in {len(colls) - 1} more)" if len(colls) > 1 else ""
+    cfg = _in_collection(cfg, a, label)
+    _out(f"in collection {label}{also}\n  -> {cfg.archive_root}", cfg)
+    return cfg
 
 
 def _available(entry) -> bool:
@@ -417,6 +464,10 @@ def cmd_get(cfg: Config, a: argparse.Namespace) -> int:
         if m:
             return _collection(cfg, a, m.group(1))
 
+        post_id = extract_post_id(a.url)
+        if post_id:
+            cfg = _post_folder(cfg, a, post_id)
+
         store = Store(cfg.state_db)
         produced: list[Path] = []
         try:
@@ -429,14 +480,7 @@ def cmd_get(cfg: Config, a: argparse.Namespace) -> int:
 
 def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
     """Collections are unsupported by yt-dlp, so we enumerate them ourselves."""
-    params = {"quiet": True, "no_warnings": True}
-    if cfg.browser_spec:
-        params["cookiesfrombrowser"] = cfg.browser_spec
-    if cfg.cookie_file:
-        params["cookiefile"] = cfg.cookie_file
-
-    with yt_dlp.YoutubeDL(params) as ydl:
-        api = PatreonApi(ydl, request_sleep=cfg.request_sleep)
+    with _api(cfg) as api:
         coll = api.collection(collection_id)
 
     label = coll.title or f"collection {collection_id}"
@@ -490,9 +534,8 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
               for _, pid in chosen}
 
     # Everything lands in a folder named after the collection, so two collections
-    # sharing a destination stay separate. State and temp stay at the root: the
-    # db is what makes re-runs resume, and it is per-destination, not per-folder.
-    cfg = dataclasses.replace(cfg, archive_root=cfg.archive_root / _folder_name(label))
+    # sharing a destination stay separate.
+    cfg = _in_collection(cfg, a, label)
     cfg.archive_root.mkdir(parents=True, exist_ok=True)
 
     # A full-collection download is the classic fat-finger outcome (an unquoted

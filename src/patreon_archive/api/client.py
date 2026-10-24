@@ -155,6 +155,24 @@ class PatreonApi:
             entries=entries,
         )
 
+    def post_collections(self, post_id: str) -> list[tuple[str, str | None]]:
+        """(collection_id, title) for each collection the post belongs to.
+
+        yt-dlp's own post request does not include collections, so this costs one
+        extra call per single-post download.
+        """
+        doc = self.get(f"posts/{post_id}", {
+            "include": "collections",
+            "fields[post]": "title",
+            "fields[collection]": "title",
+        })
+        rel = ((doc.get("data") or {}).get("relationships") or {}).get("collections") or {}
+        titles = {
+            str(i.get("id")): (i.get("attributes") or {}).get("title")
+            for i in (doc.get("included") or []) if i.get("type") == "collection"
+        }
+        return [(str(r.get("id")), titles.get(str(r.get("id")))) for r in (rel.get("data") or [])]
+
     def current_user(self) -> dict:
         """Doubles as the liveness probe: 401 here means the session is dead."""
         return self.get("current_user", {

@@ -7,8 +7,10 @@ from pathlib import Path
 # date lives in the file's own metadata tags (see `embed_metadata`) and in `-l`.
 # `--keep-id` restores the id, which is worth doing for a bulk archive: two posts
 # can share a title, and without the id the second silently overwrites the first.
-DEFAULT_OUTTMPL = "%(channel,uploader,extractor)s/%(title).150B.%(ext)s"
-OUTTMPL_WITH_ID = "%(channel,uploader,extractor)s/%(title).150B [%(id)s].%(ext)s"
+# Posts that belong to a collection drop CREATOR_DIR and sit flat in its folder.
+CREATOR_DIR = "%(channel,uploader,extractor)s/"
+DEFAULT_OUTTMPL = CREATOR_DIR + "%(title).150B.%(ext)s"
+OUTTMPL_WITH_ID = CREATOR_DIR + "%(title).150B [%(id)s].%(ext)s"
 
 
 @dataclass(frozen=True)
