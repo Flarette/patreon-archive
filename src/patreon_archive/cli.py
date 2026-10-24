@@ -446,16 +446,17 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
     The one per-post body, for a single post, the serial loop and every -j
     worker alike. `collect` gathers the files this run actually produced, for
     -a. `claims` is the run's name registry; a single-post run gets its own,
-    and its lock guards every store access here. Under -j the caller passes the
-    entry's `index`, its progress row's `hooks`, and `log(msg, err=False)`, the
-    sink for human lines.
+    and its lock guards every store access here. A collection passes the
+    entry's `index` for its events; -j also passes its progress row's `hooks`,
+    and `log(msg, err=False)`, the sink for human lines.
     """
     claims = claims or _Claims(store)
+    # Under -j lines from several posts interleave, so each names its entry; the
+    # serial loop heads each post with its number instead.
+    at = f"[{index}] " if index is not None and log is not None else ""
     if log is None:
         def log(msg: str, err: bool = False) -> None:
             _out(msg, cfg, err=err)
-    # Under -j lines from several posts interleave, so each names its entry.
-    at = f"[{index}] " if index is not None else ""
     numbered = {"index": index} if index is not None else {}
 
     post_id = extract_post_id(url)
@@ -647,7 +648,7 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
                 _out(f"[{n}/{total}] {labels.get(pid) or f'post {pid}'}", cfg)
                 try:
                     outcome = _one_post(cfg, store, post_url(pid), a.dry_run, produced,
-                                        claims)
+                                        claims, index=n)
                 except KeyboardInterrupt:
                     print("\ninterrupted", file=sys.stderr)
                     break

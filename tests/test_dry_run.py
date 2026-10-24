@@ -52,3 +52,16 @@ def test_serial_dry_run_prints_unresolved_posts(mixed):
     assert f"  failed  [6002] {BROKEN}" in r.err
     assert [line for line in r.out.splitlines()
             if line.startswith("would download")] == ["would download: Fine  [6000]"]
+
+
+def test_serial_events_carry_the_entry_index(mixed):
+    r = mixed.run(COLL, "-n", "--agent")
+
+    events = [json.loads(line) for line in r.out.splitlines()]
+    assert [(e["event"], e["index"]) for e in events
+            if e["event"] in ("post_start", "post_done", "post_would_download")] == [
+        ("post_start", 1), ("post_would_download", 1),
+        ("post_start", 2), ("post_done", 2),
+        ("post_start", 3), ("post_done", 3),
+    ]
+
