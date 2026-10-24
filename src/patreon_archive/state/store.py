@@ -68,11 +68,7 @@ class Store:
         return cur.fetchone()
 
     def should_process(self, post_id: str, *, force: bool) -> tuple[bool, str]:
-        """Invalidation rule. Returns (process?, reason).
-
-        A new tool version alone never reopens a complete post; `force` is the
-        switch for that.
-        """
+        """Invalidation rule. Returns (process?, reason)."""
         row = self.get_post(post_id)
         if force:
             return True, "forced"
@@ -188,10 +184,10 @@ class Store:
     def output_owner(self, path: str) -> str | None:
         """The video recorded as having completed `path`, or a case alias of it.
 
-        Rows from before media ids were stored carry none; their post id is the
-        owner. Should several rows claim one file, the first to record it wins:
-        its download is the one whose content is on disk. Whether the file is
-        still there does not matter: a recorded path stays its owner's.
+        Rows written before 0.4 carry no media id; their post id is the owner.
+        Should several rows claim one file, the first to record it wins: its
+        download is the one whose content is on disk. Whether the file is still
+        there does not matter: a recorded path stays its owner's.
         """
         key = self.path_key(path)
         cur = self.db.execute(
@@ -204,7 +200,6 @@ class Store:
         return None
 
     def prune_media(self, post_id: str, keep_keys: set[str]) -> None:
-        """Drop the post's media rows whose dedup_key is not in `keep_keys`."""
         keep = sorted(keep_keys)
         self.db.execute(
             "DELETE FROM post_media WHERE post_id = ? "

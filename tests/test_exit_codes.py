@@ -1,7 +1,8 @@
-"""D7: a collection run's exit code, and what Ctrl-C leaves behind."""
+"""A collection run's exit code, and what Ctrl-C leaves behind."""
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import json
 import os
 import signal
@@ -27,6 +28,11 @@ def interrupt(ydl, info, download):
     raise KeyboardInterrupt
 
 
+def signalled(ydl, info, download):
+    os.kill(os.getpid(), signal.SIGINT)
+    return ydl.process_ie_result(info, download=download)
+
+
 def swallowed(ydl, info, download):
     """Ctrl-C while recording a live stream: yt-dlp keeps what it has and goes on."""
     try:
@@ -45,7 +51,10 @@ def swallowed(ydl, info, download):
 ], ids=["no_access-serial", "no_access-parallel", "complete+no_access",
         "failed+no_access"])
 def test_collection_exit_code(patreon, locked, fails, jobs, rc):
-    # Viewable to the listing, refused at extraction: an expired session.
+    """no_access sets the code only when nothing completed: a selection that mixes
+    in a few locked posts still did its job. Locked here means viewable to the
+    listing and refused at extraction, as with an expired session.
+    """
     for pid in locked:
         patreon.post(pid, dict(ENTRIES)[pid], no_access=True)
     for pid in fails:
@@ -67,6 +76,7 @@ def stopped(patreon):
 
 
 def test_interrupted_serial_run_stops_and_skips_the_archive(stopped):
+    """An interrupted run is not the set the user asked to pack."""
     r = stopped.run(COLL, "-a", "zip")
 
     assert r.rc == 130, r
@@ -113,7 +123,6 @@ def test_ctrl_c_that_ytdlp_swallows_still_stops_the_run(patreon):
 
     assert r.rc == 130, r
     assert patreon.extract_calls == ["7001", "7002"]
-    # The interrupted post keeps the outcome yt-dlp reported.
     assert "\nsummary\n  complete         2\n" in r.out
     assert r.files == ["Run/One.mp4", "Run/Two.mp4"]
 
@@ -140,16 +149,11 @@ def test_posts_that_finish_after_ctrl_c_are_counted(patreon, sigint_seen):
     patreon.collection("44", "Run", ENTRIES[:2])
 
     def late(ydl, info, download):
-        # Finishes only once the main thread is handling the Ctrl-C.
         assert sigint_seen.wait(10)
         return ydl.process_ie_result(info, download=download)
 
-    def stop(ydl, info, download):
-        os.kill(os.getpid(), signal.SIGINT)
-        return ydl.process_ie_result(info, download=download)
-
     patreon.on_extract["7001"] = late
-    patreon.on_extract["7002"] = stop
+    patreon.on_extract["7002"] = signalled
 
     r = patreon.run(COLL, "-j", "2", "-a", "zip", "--agent")
 
@@ -158,3 +162,97 @@ def test_posts_that_finish_after_ctrl_c_are_counted(patreon, sigint_seen):
     assert [(e["summary"], e["exit_code"]) for e in events
             if e["event"] == "run_done"] == [({"complete": 2}, 130)]
     assert r.files == ["Run/One.mp4", "Run/Two.mp4"]
+
+
+def test_ctrl_c_before_the_last_submit_cancels_the_queued_posts(patreon, sigint_seen,
+                                                                monkeypatch):
+    """Ctrl-C lands while the third post sits queued and the fourth is unsubmitted."""
+    patreon.collection("44", "Run", ENTRIES + [("7004", "Four")])
+    queued = threading.Event()
+    submitted: list[cf.Future] = []
+    submit = cf.ThreadPoolExecutor.submit
+
+    def submit_then_wait(self, fn, /, *args, **kwargs):
+        future = submit(self, fn, *args, **kwargs)
+        submitted.append(future)
+        if len(submitted) == 3:
+            queued.set()
+            time.sleep(10)  # the handler raises well before this ends
+        return future
+
+    def first(ydl, info, download):
+        assert queued.wait(10)
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+        assert sigint_seen.wait(10)
+        return ydl.process_ie_result(info, download=download)
+
+    def second(ydl, info, download):
+        assert sigint_seen.wait(10)
+        return ydl.process_ie_result(info, download=download)
+
+    monkeypatch.setattr(cf.ThreadPoolExecutor, "submit", submit_then_wait)
+    patreon.on_extract["7001"] = first
+    patreon.on_extract["7002"] = second
+
+    r = patreon.run(COLL, "-j", "2")
+
+    assert r.rc == 130, r
+    assert sorted(patreon.extract_calls) == ["7001", "7002"]
+    assert r.files == ["Run/One.mp4", "Run/Two.mp4"]
+
+
+@pytest.fixture
+def sigint_restored():
+    """Puts back whatever SIGINT handler the test started with."""
+    previous = signal.getsignal(signal.SIGINT)
+    yield previous
+    signal.signal(signal.SIGINT, previous)
+
+
+def test_ignored_ctrl_c_stays_ignored(patreon, sigint_restored):
+    """As in a job a script puts in the background."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    patreon.collection("44", "Run", ENTRIES)
+    patreon.on_extract["7002"] = signalled
+
+    r = patreon.run(COLL)
+
+    assert r.rc == 0, r
+    assert r.files == ["Run/One.mp4", "Run/Three.mp4", "Run/Two.mp4"]
+    assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+
+
+def test_ctrl_c_just_after_the_handler_goes_in_still_restores_it(patreon, sigint_restored,
+                                                                 monkeypatch):
+    patreon.collection("44", "Run", ENTRIES)
+    install = signal.signal
+    landed = []
+
+    def install_then_interrupt(signum, handler):
+        previous = install(signum, handler)
+        if not landed:
+            landed.append(handler)
+            raise KeyboardInterrupt
+        return previous
+
+    monkeypatch.setattr(signal, "signal", install_then_interrupt)
+
+    r = patreon.run(COLL)
+
+    assert r.rc == 130, r
+    assert len(landed) == 1
+    assert signal.getsignal(signal.SIGINT) is sigint_restored
+    assert patreon.extract_calls == []
+
+
+def test_collection_runs_off_the_main_thread(patreon, sigint_restored):
+    """Only the main thread may set a signal handler; elsewhere SIGINT is left alone."""
+    patreon.collection("44", "Run", ENTRIES[:1])
+    runs = []
+    worker = threading.Thread(target=lambda: runs.append(patreon.run(COLL)))
+
+    worker.start()
+    worker.join(30)
+
+    assert [r.rc for r in runs] == [0], runs
+    assert signal.getsignal(signal.SIGINT) is sigint_restored

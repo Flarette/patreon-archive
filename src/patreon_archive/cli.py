@@ -71,10 +71,9 @@ def _folder_name(label: str) -> str:
 def _in_collection(cfg: Config, a: argparse.Namespace, label: str) -> Config:
     """Send downloads flat into <dest>/<collection>/.
 
-    The creator level comes off the template: a collection is one creator's, so it
-    would only nest every file a folder deeper. An explicit --outtmpl is left alone.
-    State and temp stay at the root: the db is what makes re-runs resume, and it is
-    per-destination, not per-folder.
+    A collection is one creator's, so the creator folder would only nest every
+    file a level deeper. State and temp stay at the root: the db is what makes
+    re-runs resume, and it is per-destination, not per-folder.
     """
     tmpl = cfg.outtmpl if a.outtmpl else cfg.outtmpl.removeprefix(CREATOR_DIR)
     return dataclasses.replace(cfg, archive_root=cfg.archive_root / _folder_name(label),
@@ -93,11 +92,7 @@ def _api(cfg: Config):
 
 
 def _post_folder(cfg: Config, a: argparse.Namespace, post_id: str) -> Config:
-    """A single post that belongs to a collection lands where the collection would put it.
-
-    The lookup only picks a folder, so a failure falls back to the creator folder
-    rather than costing the download.
-    """
+    """A single post that belongs to a collection lands where the collection would put it."""
     try:
         with _api(cfg) as api:
             colls = api.post_collections(post_id)
@@ -379,12 +374,10 @@ _MEDIA_STATE = {
 
 
 class _Claims:
-    """Who holds each title-only name, shared by every worker in one run (D1).
+    """Who holds each title-only name, shared by every worker in one run.
 
-    A video cannot have a name that another video in this run claimed, that the
-    store records as another video's output, or that is on disk without the store
-    recording it as this video's. yt-dlp calls this from worker threads under -j,
-    so `lock` also serialises every other store access there.
+    `lock` is the lock Store.__init__ relies on: it serialises every store access
+    under -j, including the reads yt-dlp makes through this registry.
     """
 
     def __init__(self, store: Store):
@@ -393,10 +386,9 @@ class _Claims:
         self._names: dict[str, str] = {}
 
     def __call__(self, video_id: str, path: str) -> bool:
-        # Keyed as the store keys ownership, casefolded: names that differ only
-        # in case are one file on a case-insensitive filesystem, and under -j
-        # neither exists yet when both are claimed. Elsewhere that costs at most
-        # a needless suffix.
+        # Keyed as Store.path_key keys ownership: under -j two case aliases are
+        # claimed before either exists on disk. On a case-sensitive filesystem
+        # that costs at most a needless suffix.
         key = Store.path_key(path)
         with self.lock:
             holder = self._names.get(key)
@@ -424,7 +416,6 @@ def _persist(store: Store, res, pid: str, url: str) -> None:
         outcome_detail=res.detail,
     )
     if not res.videos:
-        # Nothing reached a file, so one row carries the post's state.
         store.record_media(
             post_id=pid,
             source_kind="ytdlp_post_url",
@@ -445,7 +436,7 @@ def _persist(store: Store, res, pid: str, url: str) -> None:
         )
         keys.add(Store.dedup_key(v.video_id, None, output))
     if res.outcome == Outcome.COMPLETE:
-        # Rows the result no longer contains: older layouts, legacy keys (D5).
+        # Drop rows this result lacks, such as a pre-0.4 row keyed by its path.
         store.prune_media(pid, keys)
 
 
@@ -455,16 +446,11 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
               log: Callable[..., None] | None = None) -> Outcome:
     """Download a single post URL and record its outcome. Never raises.
 
-    The one per-post body, for a single post, the serial loop and every -j
-    worker alike. `collect` gathers the files this run actually produced, for
-    -a. `claims` is the run's name registry; a single-post run gets its own,
-    and its lock guards every store access here. A collection passes the
-    entry's `index` for its events; -j also passes its progress row's `hooks`,
-    and `log(msg, err=False)`, the sink for human lines.
+    `collect` gathers the files this run actually produced, for -a.
     """
     claims = claims or _Claims(store)
-    # Under -j lines from several posts interleave, so each names its entry; the
-    # serial loop heads each post with its number instead.
+    # Only -j passes `log`. Its lines interleave across posts, so each names its
+    # entry; the serial loop heads each post with its number instead.
     at = f"[{index}] " if index is not None and log is not None else ""
     if log is None:
         def log(msg: str, err: bool = False) -> None:
@@ -488,7 +474,8 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
     hooks = list(hooks or [])
     if cfg.agent:
         hooks.append(ev().hook(index or 0, post_id or url))
-    # Not under the lock: the claim takes it from yt-dlp's thread.
+    # Not under the lock: yt-dlp calls the claim on this thread, and the claim
+    # takes the lock, which is not reentrant.
     res = ytdlp_runner.download(target, cfg, simulate=dry_run, hooks=hooks, claim=claims)
     pid = post_id or res.post_id or url
 
@@ -497,8 +484,6 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
         log(f"would download: {res.title or '?'}  {at}[{pid}]")
         return res.outcome
 
-    # A dry run that cannot resolve the post reports it as a real run would, but
-    # records nothing.
     if not dry_run:
         with claims.lock:
             _persist(store, res, pid, url)
@@ -537,8 +522,7 @@ def cmd_get(cfg: Config, a: argparse.Namespace) -> int:
 
     m = _COLLECTION_URL.search(a.url)
 
-    # Extract browser cookies once, not once per post. A cookies file is copied
-    # instead, so nothing this run does writes to the user's file.
+    # Extract browser cookies once, not once per post.
     with materialized_jar(cfg.browser_spec, cfg.cookie_file) as jar_file:
         if jar_file and jar_file != cfg.cookie_file:
             cfg = dataclasses.replace(cfg, browser_spec=None, cookie_file=jar_file)
@@ -565,7 +549,7 @@ def _sigint_watch():
     """Yield an Event that any Ctrl-C during the block sets.
 
     yt-dlp keeps a live recording that Ctrl-C stops and returns as if it had
-    finished (downloader/external.py), so the KeyboardInterrupt never reaches
+    finished (downloader/external.py:50), so the KeyboardInterrupt never reaches
     us; the flag still does. The previous handler runs after it, so Ctrl-C
     raises as before everywhere else. Only the main thread can set a handler,
     and an ignored SIGINT, as in a job a script puts in the background, stays
@@ -681,7 +665,6 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
         with lock:
             tally[outcome] = tally.get(outcome, 0) + 1
 
-    # From here on every Ctrl-C ends at the summary and run_done below.
     try:
         with _sigint_watch() as sigint:
             try:
@@ -708,15 +691,12 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
                             break
             except KeyboardInterrupt:
                 interrupted = True
-            # The flag also catches the Ctrl-C that yt-dlp swallowed.
             interrupted = interrupted or sigint.is_set()
     finally:
         store.close()
     if interrupted:
         print("\ninterrupted", file=sys.stderr)
 
-    # D7. no_access decides the code only when nothing completed: a selection
-    # that mixes in a few locked posts still did its job.
     if interrupted:
         code = EXIT_INTERRUPTED
     elif tally.get(Outcome.FAILED):
@@ -735,7 +715,6 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
         if tally.get(oc):
             _out(f"  {oc:16} {tally[oc]}", cfg)
 
-    # An interrupted run is not the set the user asked to pack.
     if not interrupted:
         _maybe_archive(cfg, a, produced)
     return code
@@ -766,11 +745,7 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
               sigint: threading.Event | None = None) -> bool:
     """Run N posts at once, each owning one live progress row.
 
-    Every worker shares one name registry, whose lock `_one_post` holds for
-    store access: sqlite3 connections are not thread-safe, and the registry
-    reads the store from yt-dlp's threads. Returns whether Ctrl-C, or a set
-    `sigint`, cut the run short; posts in flight then finish first, and queued
-    ones are cancelled.
+    Returns whether Ctrl-C, or a set `sigint`, cut the run short.
     """
     slots = min(cfg.concurrency, len(chosen))
     free: queue.Queue[int] = queue.Queue()
@@ -781,7 +756,7 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
 
     with MultilineProgress(slots) as ui:
         def log(msg: str, err: bool = False) -> None:
-            ui.log(msg)  # already stderr, with the rows
+            ui.log(msg)  # ui.log writes to stderr already, so `err` changes nothing
 
         def work(n: int, pid: str) -> None:
             # Each worker counts its own post, so one that finishes while an
@@ -860,7 +835,6 @@ def _out(msg: str, cfg: Config, *, err: bool = False) -> None:
     print(msg, file=sys.stderr if (err or cfg.agent) else sys.stdout)
 
 
-# Flags whose spec may start with '-', and what such a spec looks like.
 _SPEC_FLAGS = ("-i", "-I", "--items", "-x", "--exclude")
 _DASH_SPEC = re.compile(r"-[\d,-]+")
 
@@ -881,7 +855,7 @@ def main(argv: list[str] | None = None) -> int:
         raw.insert(0, "get")
 
     # argparse takes a spec like '-3-' (the last three) for a flag, which leaves
-    # `-i -3-` without its value. Join the two as `-i=-3-` first (D8).
+    # `-i -3-` without its value, so the two are joined as `-i=-3-`.
     joined: list[str] = []
     for arg in raw:
         if joined and joined[-1] in _SPEC_FLAGS and _DASH_SPEC.fullmatch(arg):

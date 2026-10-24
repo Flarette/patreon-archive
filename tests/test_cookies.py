@@ -1,4 +1,4 @@
-"""C2, D6: a cookies file is only ever read; each download loads its own copy."""
+"""A cookies file is only ever read; each download loads its own copy."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ ENTRIES = [("8001", "One"), ("8002", "Two"), ("8003", "Three"),
 FILES = sorted(f"Batch/{title}.mp4" for _, title in ENTRIES)
 # A fixed past mtime, so a rewrite shows even within one tick of the clock.
 OLD_NS = 1_000_000_000 * 10**9
-# Only the passthrough file holds this cookie, so a jar that has it came from there.
 MARKER = "pa_passthrough"
 
 
@@ -29,7 +28,7 @@ class Jar(NamedTuple):
 
 
 def _as_users(path: Path) -> None:
-    # Readable by others, so a copy that kept the source's mode would show.
+    """Give `path` a mode a copy must not keep, and the fixed past mtime."""
     os.chmod(path, 0o644)
     os.utime(path, ns=(OLD_NS, OLD_NS))
 
@@ -112,3 +111,20 @@ def test_a_copy_that_fails_in_setup_leaves_no_temp_file(tmp_path, monkeypatch):
         pass
 
     assert _leftovers() == []
+
+
+@pytest.mark.parametrize("spelled", ["~/jar.txt", "$PA_JARS/jar.txt"])
+def test_cookies_path_is_expanded_as_ytdlp_expands_it(monkeypatch, spelled):
+    jar = Path.home() / "jar.txt"
+    jar.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setenv("PA_JARS", str(Path.home()))
+
+    with private_copy(spelled) as copy:
+        assert Path(copy).read_bytes() == jar.read_bytes()
+
+    assert _leftovers() == []
+
+
+def test_no_cookies_file_means_no_copy():
+    with private_copy(None) as copy:
+        assert copy is None

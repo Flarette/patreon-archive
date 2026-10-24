@@ -11,7 +11,7 @@ from pathlib import Path
 # Posts that belong to a collection drop CREATOR_DIR and sit flat in its folder.
 # Every segment is byte-bounded here (creator 100 B, title 150 B plus suffix and
 # extension), so these never need yt-dlp's trim_file_name, which cuts the whole
-# rendered path and would cut the suffix off with it.
+# rendered path and would cut the suffix off with it (YoutubeDL.py:1547).
 CREATOR_DIR = "%(channel,uploader,extractor).100B/"
 DEFAULT_OUTTMPL = CREATOR_DIR + "%(title).150B%(pa_suffix|)s.%(ext)s"
 OUTTMPL_WITH_ID = CREATOR_DIR + "%(title).150B [%(id)s].%(ext)s"

@@ -180,11 +180,7 @@ class FakePatreon:
         return post
 
     def collection(self, cid, title, entries) -> None:
-        """`entries` oldest first, as (pid, title); a None title is a blocked entry.
-
-        Entries not registered with post() are registered here, blocked ones as
-        no_access.
-        """
+        """`entries` oldest first, as (pid, title); a None title is a blocked entry."""
         entries = [(str(pid), t) for pid, t in entries]
         for pid, t in entries:
             if pid not in self.posts:

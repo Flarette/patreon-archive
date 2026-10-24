@@ -1,6 +1,6 @@
-"""R1: numbers count the whole collection, oldest first, blocked entries included.
+"""Numbers count the whole collection, oldest first, blocked entries included.
 
-D8: a spec that starts with '-' may follow its flag as a separate word.
+A spec that starts with '-' may follow its flag as a separate word.
 """
 
 from __future__ import annotations
@@ -12,8 +12,6 @@ import pytest
 
 URL = "https://www.patreon.com/collection/77"
 
-# Entries 2 and 6 are blocked. Pids differ from their numbers, so an
-# off-by-one picks a visibly wrong post.
 ENTRIES = [("9001", "One"), ("9002", None), ("9003", "Three"),
            ("9004", "Four"), ("9005", "Five"), ("9006", None)]
 

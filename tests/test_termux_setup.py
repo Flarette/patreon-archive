@@ -1,4 +1,4 @@
-"""D9: termux-setup.sh installs the highest wheel version next to it."""
+"""termux-setup.sh installs the highest wheel version next to it."""
 
 from __future__ import annotations
 

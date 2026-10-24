@@ -1,4 +1,4 @@
-"""R4, D1-D3, D5, D10: same-title posts keep distinct files; a multi-video post is whole."""
+"""Same-title posts keep distinct files; a multi-video post is whole."""
 
 from __future__ import annotations
 
@@ -35,6 +35,14 @@ def media_rows(patreon, pid: str) -> list[tuple[str | None, str | None]]:
          r["output_path"] and Path(r["output_path"]).relative_to(patreon.out).as_posix())
         for r in rows
     )
+
+
+def legacy_row(store, pid: str, title: str, path: Path) -> None:
+    """Record `pid` as a pre-0.4 run did: no media id, keyed by its output path."""
+    store.upsert_post(post_id=pid, outcome=Outcome.COMPLETE, tool_version="0.3.0",
+                      ytdlp_version="2026.07.04", title=title)
+    store.record_media(post_id=pid, source_kind="ytdlp_post_url", state="complete",
+                       output_path=str(path))
 
 
 @pytest.fixture
@@ -104,10 +112,13 @@ def test_unrecorded_file_on_disk_takes_the_name(patreon, media):
 def test_multi_video_post_is_one_complete_post(patreon):
     patreon.post("3001", "Episode 5", videos=["a", "b"])
 
-    r = patreon.run(post_url("3001"))
+    r = patreon.run(post_url("3001"), "--agent")
 
     assert r.rc == 0, r
     assert r.files == ["Creator/Episode 5 [3001-2].mp4", "Creator/Episode 5.mp4"]
+    events = [json.loads(line) for line in r.out.splitlines()]
+    assert [e["path"] for e in events if e["event"] == "post_done"] == [
+        str(patreon.out / "Creator/Episode 5.mp4")]
     store = patreon.store()
     assert store.get_post("3001")["outcome"] == Outcome.COMPLETE
     assert store.get_post("3001-1") is None
@@ -123,6 +134,7 @@ def test_multi_video_post_is_one_complete_post(patreon):
 
 
 def test_multi_video_post_with_a_failed_video_resumes(patreon, tmp_path):
+    """The video that finished is recorded, so the re-run keeps its name."""
     patreon.post("3002", "Episode 6", videos=["a", "b"])
 
     def second_is_missing(ydl, info, download):
@@ -135,7 +147,6 @@ def test_multi_video_post_with_a_failed_video_resumes(patreon, tmp_path):
 
     assert first.rc == 1, first
     assert patreon.store().get_post("3002")["outcome"] == Outcome.FAILED
-    # The video that finished is recorded, so a re-run does not take its name.
     assert media_rows(patreon, "3002") == [("3002-1", "Creator/Episode 6.mp4")]
     assert first.files == ["Creator/Episode 6.mp4"]
 
@@ -155,8 +166,7 @@ def test_multi_video_post_with_a_failed_video_resumes(patreon, tmp_path):
     (("--outtmpl", "%(channel)s/%(title)s.%(ext)s"), "Creator/Clip.mp4"),
 ], ids=["keep-id", "outtmpl"])
 def test_explicit_templates_never_get_a_suffix(patreon, media, args, name):
-    # The name is already on disk and unrecorded: the default template would
-    # suffix it, these must not.
+    """The name is on disk and unrecorded: the default template would suffix it."""
     (patreon.out / "Creator").mkdir(parents=True)
     shutil.copyfile(media["c"], patreon.out / name)
     patreon.post("501", "Clip")
@@ -172,12 +182,7 @@ def test_legacy_row_keeps_its_name_and_is_replaced(patreon, media):
     path = patreon.out / "Creator/Legacy.mp4"
     shutil.copyfile(media["a"], path)
     patreon.post("601", "Legacy")
-    # As a pre-0.4 run wrote it: no media id, keyed by its output path.
-    store = patreon.store()
-    store.upsert_post(post_id="601", outcome=Outcome.COMPLETE, tool_version="0.3.0",
-                      ytdlp_version="2026.07.04", title="Legacy")
-    store.record_media(post_id="601", source_kind="ytdlp_post_url", state="complete",
-                       output_path=str(path))
+    legacy_row(patreon.store(), "601", "Legacy", path)
 
     r = patreon.run(post_url("601"), "--force")
 
@@ -185,6 +190,26 @@ def test_legacy_row_keeps_its_name_and_is_replaced(patreon, media):
     assert r.files == ["Creator/Legacy.mp4"]
     rows = patreon.store().media_for("601")
     assert [(m["media_id"], m["dedup_key"]) for m in rows] == [("601", "601")]
+
+
+def test_legacy_rows_sharing_a_file_leave_it_to_the_first(patreon, media):
+    """Before 0.4, a second same-title post found the name on disk and recorded it
+    as its own. The file holds the first post's download, so the first row owns it.
+    """
+    (patreon.out / "Creator").mkdir(parents=True)
+    path = patreon.out / "Creator/Live.mp4"
+    shutil.copyfile(media["a"], path)
+    patreon.post("2201", "Live", media="a")
+    patreon.post("2202", "Live", media="b")
+    store = patreon.store()
+    legacy_row(store, "2201", "Live", path)
+    legacy_row(store, "2202", "Live", path)
+
+    r = patreon.run(post_url("2202"), "--force")
+
+    assert r.rc == 0, r
+    assert r.files == ["Creator/Live [2202].mp4", "Creator/Live.mp4"]
+    assert path.read_bytes() == media["a"].read_bytes()
 
 
 def test_long_creator_and_title_keep_the_suffix(patreon):
@@ -202,6 +227,15 @@ def test_long_creator_and_title_keep_the_suffix(patreon):
     folder, name = creator[:100], title[:150]
     assert r.files == [f"{folder}/{name} [2002].mp4", f"{folder}/{name}.mp4"]
     assert date_tag(patreon.out / folder / f"{name}.mp4") == "20240101"
+
+
+def test_user_template_keeps_ytdlps_trim(patreon):
+    patreon.post("2101", "T" * 200)
+
+    r = patreon.run(post_url("2101"), "--outtmpl", "%(title)s.%(ext)s")
+
+    assert r.rc == 0, r
+    assert r.files == ["T" * 180 + ".mp4"]
 
 
 def test_taken_suffixed_name_fails_the_video(patreon):
@@ -279,10 +313,10 @@ def test_multi_video_post_with_a_missing_entry_resumes(patreon):
                                               ("ΐ", "Ϊ́")],
                          ids=["ascii", "non-ascii", "nfd", "case-and-form"])
 def test_moved_away_file_still_owns_its_case_alias(patreon, theirs, mine):
+    """The owner moves finished files off the device; the record stays."""
     patreon.post("1", theirs, media="a")
     patreon.post("2", mine, media="b")
     assert patreon.run(post_url("1")).rc == 0
-    # The owner moves finished files off the device; the record stays.
     (patreon.out / f"Creator/{theirs}.mp4").unlink()
 
     r = patreon.run(post_url("2"))

@@ -1,4 +1,4 @@
-"""R2: sidecars are opt-in, and the date travels in the file's own tags."""
+"""Sidecars are opt-in, and the date travels in the file's own tags."""
 
 from __future__ import annotations
 

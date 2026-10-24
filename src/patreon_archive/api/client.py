@@ -158,8 +158,9 @@ class PatreonApi:
     def post_collections(self, post_id: str) -> list[tuple[str, str | None]]:
         """(collection_id, title) for each collection the post belongs to.
 
-        yt-dlp's own post request does not include collections, so this costs one
-        extra call per single-post download.
+        yt-dlp's own post request does not include collections
+        (extractor/patreon.py:390), so this costs one extra call per single-post
+        download.
         """
         doc = self.get(f"posts/{post_id}", {
             "include": "collections",

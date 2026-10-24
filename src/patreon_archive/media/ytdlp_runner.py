@@ -22,7 +22,7 @@ _NO_ACCESS = re.compile(r"do not have access", re.I)
 _NO_MEDIA = re.compile(r"no supported media found", re.I)
 
 
-# The template field that carries " [<id>]" when a title-only name is taken.
+# Spelled as in config.DEFAULT_OUTTMPL, so finding it marks that template.
 SUFFIX_FIELD = "%(pa_suffix|)s"
 
 
@@ -40,7 +40,7 @@ class Result:
     detail: str | None = None
     title: str | None = None
     # The extractor's top-level id, which for an embed can be the provider's;
-    # never a multi-video entry id. State is stored under the requested id (D2).
+    # never a multi-video entry id. cli stores state under the requested id.
     post_id: str | None = None
     uploader: str | None = None
     duplicate_of: Path | None = None
@@ -123,9 +123,8 @@ def build_params(cfg: Config, hooks: list | None = None) -> dict:
     if hooks:
         params["progress_hooks"] = hooks
     params.update(cfg.extra_ytdlp)
-    # Our templates bound each path segment themselves; trimming the rendered
-    # path would cut a suffix off and merge two names into one. A user template
-    # has no such bound, so it keeps the trim.
+    # Only a user template keeps the trim: ours bound each segment instead, and
+    # trimming the rendered path would cut the suffix off (config.py).
     if not is_builtin_outtmpl(params["outtmpl"].get("default", "")):
         params.setdefault("trim_file_name", 180)
     return params
@@ -134,8 +133,9 @@ def build_params(cfg: Config, hooks: list | None = None) -> dict:
 class _ClaimName(PostProcessor):
     """Gives a video its title-only name, or appends " [<id>]" when that is taken.
 
-    Runs at the `video` stage, which yt-dlp calls before it computes the filename,
-    so the field set here is in the name the download is written under.
+    Runs at the `video` stage, which yt-dlp calls before it computes the filename
+    (YoutubeDL.process_info, YoutubeDL.py:3360 then 3365), so the field set here
+    is in the name the download is written under.
     """
 
     def __init__(self, claim: Callable[[str, str], bool]):
@@ -144,7 +144,6 @@ class _ClaimName(PostProcessor):
 
     def run(self, info):
         vid = str(info["id"])
-        # pa_suffix is still unset, so this renders the title-only path.
         path = self._downloader.prepare_filename(info)
         if not path or self._claim(vid, path):
             return [], info
@@ -154,7 +153,8 @@ class _ClaimName(PostProcessor):
             # Never fall back onto a file that is someone else's. Not a
             # PostProcessingError: yt-dlp only logs that one here, runs the
             # download step anyway, and raises it after (never, with
-            # --ignore-errors).
+            # --ignore-errors). See YoutubeDL.pre_process and run_pp,
+            # YoutubeDL.py:3843 and 3816.
             raise DownloadError(f"no free name for {vid}: {alt} is taken")
         return [], info
 
@@ -218,9 +218,7 @@ def download(url: str, cfg: Config, *, simulate: bool = False, hooks: list | Non
     """Download one post. `claim(video_id, path)` says whether the video may take
     the title-only `path`; when it may not, the name gets " [<id>]".
 
-    Every call loads its own copy of the cookies file: yt-dlp writes the jar
-    back when it closes, and under -j the posts would otherwise rewrite one
-    file while another is loading it. The copy is of whatever file the merged
+    Each call loads its own private_copy of whatever cookies file the merged
     params name, so a passthrough --cookies is never written either.
     """
     params = build_params(cfg, hooks)
@@ -242,8 +240,6 @@ def _download(url: str, params: dict, simulate: bool,
     try:
         with yt_dlp.YoutubeDL(params) as ydl:
             ydl.add_post_processor(finished, when="after_move")
-            # Only the default template carries the field; --keep-id and a user
-            # template are left alone. Dry runs write nothing, so never claim.
             if claim and not simulate and SUFFIX_FIELD in params["outtmpl"].get("default", ""):
                 ydl.add_post_processor(_ClaimName(claim), when="video")
             info = ydl.extract_info(url, download=not simulate)
@@ -253,8 +249,6 @@ def _download(url: str, params: dict, simulate: bool,
         res = Result(Outcome.FAILED, detail=f"{type(exc).__name__}: {exc}")
     else:
         return _result(info, simulate)
-    # The post keeps the error's outcome, but the videos that finished before it
-    # are still reported, so they get recorded.
     res.videos = [_judge(vid, path) for vid, path in finished.paths.items()]
     return res
 
@@ -281,14 +275,14 @@ def _result(info: dict | None, simulate: bool) -> Result:
         meta.detail = "simulated"
         return meta
 
-    # yt-dlp leaves None where an entry failed under --ignore-errors; that video
-    # is missing, and the post is not complete without it.
+    # yt-dlp leaves None where an entry failed under --ignore-errors
+    # (YoutubeDL.__process_playlist, YoutubeDL.py:2181); that video is missing,
+    # and the post is not complete without it.
     meta.videos = [
         _judge(str(e.get("id") or ""), _final_path(e)) if e
         else Video(f"{pid}-{n}", Outcome.FAILED, None, "video missing from the extraction result")
         for n, e in enumerate(entries, 1)
     ]
-    # Complete only when every video is (D3); otherwise the worst of them.
     bad = [v for v in meta.videos if v.outcome != Outcome.COMPLETE]
     if bad:
         worst = next((v for v in bad if v.outcome == Outcome.FAILED), bad[0])

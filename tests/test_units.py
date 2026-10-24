@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from patreon_archive.cli import _pretty_date, _resolve_output
+from patreon_archive.config import (CREATOR_DIR, DEFAULT_OUTTMPL, OUTTMPL_WITH_ID,
+                                    is_builtin_outtmpl)
 from patreon_archive.selection import parse_items
 
 
@@ -46,3 +48,14 @@ def test_pretty_date():
 ])
 def test_parse_items(spec, exclude, expected):
     assert parse_items(spec, 6, exclude) == expected
+
+
+@pytest.mark.parametrize(("tmpl", "ours"), [
+    (DEFAULT_OUTTMPL, True),
+    (DEFAULT_OUTTMPL.removeprefix(CREATOR_DIR), True),
+    (OUTTMPL_WITH_ID, True),
+    (OUTTMPL_WITH_ID.removeprefix(CREATOR_DIR), True),
+    ("%(title)s.%(ext)s", False),
+], ids=["default", "default-collection", "keep-id", "keep-id-collection", "user"])
+def test_is_builtin_outtmpl_knows_both_forms(tmpl, ours):
+    assert is_builtin_outtmpl(tmpl) is ours
