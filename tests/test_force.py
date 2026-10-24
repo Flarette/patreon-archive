@@ -61,3 +61,23 @@ def test_forced_rerun_of_a_suffixed_post_leaves_the_other_file(patreon, media):
     assert r.files == first.files == ["Talks/Live Q&A [2002].mp4", "Talks/Live Q&A.mp4"]
     assert picture(patreon.out / "Talks/Live Q&A [2002].mp4") == picture(media["c"])
     assert plain.read_bytes() == before
+
+
+def test_forced_run_staged_in_another_collections_folder_leaves_its_file(patreon, media):
+    """With --temp-dir on another collection's folder, the forced post's staging
+    path would be that collection's finished file, which yt-dlp clears first."""
+    patreon.collection("1", "First", [("9001", "Clip")])
+    patreon.collection("2", "Second", [("9002", "Clip")])
+    patreon.posts["9002"].media = "b"
+    assert patreon.run("https://www.patreon.com/collection/1").rc == 0
+    assert patreon.run("https://www.patreon.com/collection/2").rc == 0
+    theirs = patreon.out / "First/Clip.mp4"
+    before = theirs.read_bytes()
+    patreon.posts["9002"].media = "c"
+
+    r = patreon.run(post_url("9002"), "--force", "--temp-dir", str(patreon.out / "First"))
+
+    assert r.rc == 0, r
+    assert r.files == ["First/Clip.mp4", "Second/Clip.mp4"]
+    assert theirs.read_bytes() == before
+    assert picture(patreon.out / "Second/Clip.mp4") == picture(media["c"])

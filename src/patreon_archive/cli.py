@@ -173,7 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "path-shaped ('~/movies', './x', '/a/b') is used as given. "
                              f"Created if missing. Default root: {DEFAULT_OUTPUT_DIR} "
                              "(env PATREON_ARCHIVE_OUTPUT)")
-    common.add_argument("--temp-dir", type=Path, default=None)
+    common.add_argument("--temp-dir", type=Path, default=None,
+                        help="staging area; files are staged in a .patreon-archive-tmp "
+                             "folder inside it (default: <output-dir>/.tmp)")
     common.add_argument("--state-db", type=Path, default=None,
                         help="default: <output-dir>/.patreon-archive.db")
     common.add_argument("--outtmpl", default=None,
@@ -330,9 +332,13 @@ def _config(a: argparse.Namespace) -> Config:
         a.cookies_file = os.environ.get("PATREON_ARCHIVE_COOKIES") or None
 
     out = _resolve_output(a.output_dir)
+    # Staging gets a folder of its own. Before a forced download yt-dlp clears
+    # a video's staging path, which in a folder shared with finished files can
+    # be another video's. <dest>/.tmp is ours already.
+    temp = a.temp_dir / ".patreon-archive-tmp" if a.temp_dir else out / ".tmp"
     return Config(
         archive_root=out,
-        temp_dir=(a.temp_dir or out / ".tmp").expanduser().resolve(),
+        temp_dir=temp.expanduser().resolve(),
         state_db=(a.state_db or out / ".patreon-archive.db").expanduser().resolve(),
         browser_spec=None if a.cookies_file else parse_browser_spec(a.browser),
         cookie_file=a.cookies_file,

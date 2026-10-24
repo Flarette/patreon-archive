@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from patreon_archive.cli import _pretty_date, _resolve_output
+from patreon_archive.cli import _config, _pretty_date, _resolve_output, build_parser
 from patreon_archive.config import (CREATOR_DIR, DEFAULT_OUTTMPL, OUTTMPL_WITH_ID,
                                     is_builtin_outtmpl)
 from patreon_archive.selection import parse_items
@@ -35,6 +35,21 @@ def test_resolve_output_root_from_env(tmp_path, monkeypatch):
 
     assert _resolve_output(None) == root
     assert _resolve_output("films") == root / "films"
+
+
+@pytest.mark.parametrize(("temp_dir", "expected"), [
+    (None, "dest/.tmp"),
+    ("shared", "shared/.patreon-archive-tmp"),
+], ids=["default", "given"])
+def test_staging_is_a_folder_of_its_own(tmp_path, temp_dir, expected):
+    """yt-dlp clears a video's staging path before a forced download, so staging
+    never shares a folder with finished files."""
+    args = ["get", "https://www.patreon.com/posts/1", "-o", str(tmp_path / "dest")]
+    if temp_dir:
+        args += ["--temp-dir", str(tmp_path / temp_dir)]
+    a = build_parser().parse_args(args)
+
+    assert _config(a).temp_dir == tmp_path.resolve() / expected
 
 
 def test_pretty_date():
