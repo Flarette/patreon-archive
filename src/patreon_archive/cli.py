@@ -380,11 +380,11 @@ class _Claims:
         self._names: dict[str, str] = {}
 
     def __call__(self, video_id: str, path: str) -> bool:
-        path = str(Path(path))
-        # Casefolded on every filesystem: on a case-insensitive one, names that
-        # differ only in case are one file, and under -j neither exists yet when
-        # both are claimed. Elsewhere it costs at most a needless suffix.
-        key = path.casefold()
+        # Keyed as the store keys ownership, casefolded: names that differ only
+        # in case are one file on a case-insensitive filesystem, and under -j
+        # neither exists yet when both are claimed. Elsewhere that costs at most
+        # a needless suffix.
+        key = Store.path_key(path)
         with self.lock:
             holder = self._names.get(key)
             if holder is not None:

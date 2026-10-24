@@ -269,3 +269,36 @@ def test_multi_video_post_with_a_missing_entry_resumes(patreon):
     assert patreon.extract_calls == ["3003", "3003"]
     assert r.files == ["Creator/Episode 7 [3003-2].mp4", "Creator/Episode 7.mp4"]
     assert patreon.store().get_post("3003")["outcome"] == Outcome.COMPLETE
+
+
+# Non-ASCII too: SQLite's NOCASE folds ASCII only.
+@pytest.mark.parametrize(("theirs", "mine"), [("Clip", "clip"), ("Été", "été")],
+                         ids=["ascii", "non-ascii"])
+def test_moved_away_file_still_owns_its_case_alias(patreon, theirs, mine):
+    patreon.post("1", theirs, media="a")
+    patreon.post("2", mine, media="b")
+    assert patreon.run(post_url("1")).rc == 0
+    # The owner moves finished files off the device; the record stays.
+    (patreon.out / f"Creator/{theirs}.mp4").unlink()
+
+    r = patreon.run(post_url("2"))
+
+    assert r.rc == 0, r
+    assert r.files == [f"Creator/{mine} [2].mp4"]
+    assert media_rows(patreon, "1") == [("1", f"Creator/{theirs}.mp4")]
+
+
+def test_title_case_change_keeps_the_recorded_file(patreon):
+    post = patreon.post("501", "Clip")
+    assert patreon.run(post_url("501")).rc == 0
+    post.title = "clip"
+
+    r = patreon.run(post_url("501"), "--force")
+
+    assert r.rc == 0, r
+    assert not any("[501]" in f for f in r.files), r.files
+    if (patreon.out / "Creator/CLIP.mp4").exists():
+        # Case-insensitive storage: the alias is the recorded file, so nothing
+        # is fetched again.
+        assert r.files == ["Creator/Clip.mp4"]
+        assert "has already been downloaded" in r.out

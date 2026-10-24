@@ -49,6 +49,16 @@ class Store:
         """
         return media_id or url_md5 or output_path or "-"
 
+    @staticmethod
+    def path_key(path: str | Path) -> str:
+        """The ownership identity of an output path.
+
+        Casefolded on every filesystem: on a case-insensitive one, paths that
+        differ only in case are one file. SQLite's NOCASE and lower() fold ASCII
+        only, so the comparison happens here rather than in SQL.
+        """
+        return str(Path(path)).casefold()
+
     def get_post(self, post_id: str) -> sqlite3.Row | None:
         cur = self.db.execute("SELECT * FROM post WHERE post_id = ?", (post_id,))
         return cur.fetchone()
@@ -170,19 +180,22 @@ class Store:
         self.db.commit()
 
     def output_owner(self, path: str) -> str | None:
-        """The video recorded as having completed `path`, if any.
+        """The video recorded as having completed `path`, or a case alias of it.
 
         Rows from before media ids were stored carry none; their post id is the
         owner. Should several rows claim one file, the first to record it wins:
-        its download is the one whose content is on disk.
+        its download is the one whose content is on disk. Whether the file is
+        still there does not matter: a recorded path stays its owner's.
         """
+        key = self.path_key(path)
         cur = self.db.execute(
-            """SELECT COALESCE(media_id, post_id) AS owner FROM post_media
-               WHERE output_path = ? AND state = 'complete' ORDER BY rowid LIMIT 1""",
-            (path,),
+            """SELECT COALESCE(media_id, post_id) AS owner, output_path FROM post_media
+               WHERE output_path IS NOT NULL AND state = 'complete' ORDER BY rowid"""
         )
-        row = cur.fetchone()
-        return row["owner"] if row else None
+        for row in cur:
+            if self.path_key(row["output_path"]) == key:
+                return row["owner"]
+        return None
 
     def prune_media(self, post_id: str, keep_keys: set[str]) -> None:
         """Drop the post's media rows whose dedup_key is not in `keep_keys`."""
