@@ -168,7 +168,8 @@ class FakePatreon:
              collections=(), no_access=False, videos=None) -> FakePost:
         post = FakePost(pid=str(pid), title=title, media=media, channel=channel,
                         upload_date=upload_date, collections=list(collections),
-                        no_access=no_access, videos=list(videos) if videos else None)
+                        no_access=no_access,
+                        videos=list(videos) if videos is not None else None)
         self.posts[post.pid] = post
         return post
 
