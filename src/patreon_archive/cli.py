@@ -397,10 +397,8 @@ class _Claims:
             return True
 
 
-def _persist(store: Store, res, pid: str, url: str, dry_run: bool) -> None:
+def _persist(store: Store, res, pid: str, url: str) -> None:
     """Record the post under the requested id `pid`, and one media row per video."""
-    if dry_run:
-        return
     store.upsert_post(
         post_id=pid,
         outcome=res.outcome,
@@ -481,13 +479,16 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
     res = ytdlp_runner.download(target, cfg, simulate=dry_run, hooks=hooks, claim=claims)
     pid = post_id or res.post_id or url
 
-    if dry_run:
+    if dry_run and res.outcome == Outcome.COMPLETE:
         ev().emit("post_would_download", **numbered, post_id=pid, title=res.title)
         log(f"would download: {res.title or '?'}  {at}[{pid}]")
         return res.outcome
 
-    with claims.lock:
-        _persist(store, res, pid, url, dry_run)
+    # A dry run that cannot resolve the post reports it as a real run would, but
+    # records nothing.
+    if not dry_run:
+        with claims.lock:
+            _persist(store, res, pid, url)
 
     ev().emit(
         "post_done", **numbered, post_id=pid, outcome=str(res.outcome), title=res.title,
