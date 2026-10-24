@@ -365,7 +365,35 @@ _MEDIA_STATE = {
 }
 
 
+class _Claims:
+    """Who holds each title-only name, shared by every worker in one run (D1).
+
+    A video cannot have a name that another video in this run claimed, that the
+    store records as another video's output, or that is on disk without the store
+    recording it as this video's. yt-dlp calls this from worker threads under -j,
+    so `lock` also serialises every other store access there.
+    """
+
+    def __init__(self, store: Store):
+        self.store = store
+        self.lock = threading.Lock()
+        self._names: dict[str, str] = {}
+
+    def __call__(self, video_id: str, path: str) -> bool:
+        key = str(Path(path))
+        with self.lock:
+            holder = self._names.get(key)
+            if holder is not None:
+                return holder == video_id
+            owner = self.store.output_owner(key)
+            if owner != video_id and (owner is not None or Path(key).exists()):
+                return False
+            self._names[key] = video_id
+            return True
+
+
 def _persist(store: Store, res, pid: str, url: str, dry_run: bool) -> None:
+    """Record the post under the requested id `pid`, and one media row per video."""
     if dry_run:
         return
     store.upsert_post(
@@ -376,24 +404,42 @@ def _persist(store: Store, res, pid: str, url: str, dry_run: bool) -> None:
         title=res.title,
         post_url=url,
         can_view=0 if res.outcome == Outcome.NO_ACCESS else 1,
-        media_expected=1,
-        media_obtained=1 if res.outcome == Outcome.COMPLETE else 0,
+        media_expected=len(res.videos),
+        media_obtained=sum(v.outcome == Outcome.COMPLETE for v in res.videos),
         outcome_detail=res.detail,
     )
-    store.record_media(
-        post_id=pid,
-        source_kind="ytdlp_post_url",
-        state=_MEDIA_STATE[res.outcome],
-        output_path=str(res.filepath) if res.filepath else None,
-        detail=res.detail,
-    )
+    if not res.videos:
+        # Nothing reached a file, so one row carries the post's state.
+        store.record_media(
+            post_id=pid,
+            source_kind="ytdlp_post_url",
+            state=_MEDIA_STATE[res.outcome],
+            detail=res.detail,
+        )
+        return
+    keys = set()
+    for v in res.videos:
+        output = str(v.filepath) if v.filepath else None
+        store.record_media(
+            post_id=pid,
+            source_kind="ytdlp_post_url",
+            state=_MEDIA_STATE[v.outcome],
+            media_id=v.video_id,
+            output_path=output,
+            detail=v.detail,
+        )
+        keys.add(Store.dedup_key(v.video_id, None, output))
+    if res.outcome == Outcome.COMPLETE:
+        # Rows the result no longer contains: older layouts, legacy keys (D5).
+        store.prune_media(pid, keys)
 
 
 def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
-              collect: list[Path] | None = None) -> Outcome:
+              collect: list[Path] | None = None, claims: _Claims | None = None) -> Outcome:
     """Download a single post URL and record its outcome. Never raises.
 
-    `collect` gathers the files this run actually produced, for -a.
+    `collect` gathers the files this run actually produced, for -a. `claims` is
+    the run's name registry; a single-post run gets its own.
     """
     post_id = extract_post_id(url)
     if post_id:
@@ -414,8 +460,9 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
         target, cfg,
         simulate=dry_run,
         hooks=[ev().hook(0, post_id or url)] if cfg.agent else None,
+        claim=claims or _Claims(store),
     )
-    pid = res.post_id or post_id or url
+    pid = post_id or res.post_id or url
 
     if dry_run:
         ev().emit("post_would_download", post_id=pid, title=res.title)
@@ -430,11 +477,12 @@ def _one_post(cfg: Config, store: Store, url: str, dry_run: bool,
         bytes=res.filepath.stat().st_size if (res.filepath and res.filepath.exists()) else None,
         detail=res.detail,
     )
-    if res.outcome == Outcome.COMPLETE and res.filepath:
-        if collect is not None and res.filepath.exists():
-            collect.append(res.filepath)
-        mb = res.filepath.stat().st_size / (1024 * 1024)
-        _out(f"  ok  {res.filepath.name}  ({mb:.1f} MiB)", cfg)
+    if res.outcome == Outcome.COMPLETE:
+        for v in res.videos:
+            if collect is not None:
+                collect.append(v.filepath)
+            mb = v.filepath.stat().st_size / (1024 * 1024)
+            _out(f"  ok  {v.filepath.name}  ({mb:.1f} MiB)", cfg)
     elif res.outcome == Outcome.NO_ACCESS:
         _out(f"  no access  [{pid}] {res.detail}", cfg, err=True)
     elif res.outcome == Outcome.INDETERMINATE:
@@ -564,6 +612,7 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
     tally: dict[Outcome, int] = {}
     produced: list[Path] = []
     store = Store(cfg.state_db)
+    claims = _Claims(store)
     lock = threading.Lock()
 
     def record(outcome: Outcome) -> None:
@@ -572,12 +621,13 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
 
     try:
         if cfg.concurrency > 1:
-            _parallel(cfg, store, chosen, a, record, produced, labels)
+            _parallel(cfg, store, chosen, a, record, produced, labels, claims)
         else:
             for n, pid in chosen:
                 _out(f"[{n}/{total}] {labels.get(pid) or f'post {pid}'}", cfg)
                 try:
-                    outcome = _one_post(cfg, store, post_url(pid), a.dry_run, produced)
+                    outcome = _one_post(cfg, store, post_url(pid), a.dry_run, produced,
+                                        claims)
                 except KeyboardInterrupt:
                     print("\ninterrupted", file=sys.stderr)
                     break
@@ -627,16 +677,19 @@ def _maybe_archive(cfg: Config, a: argparse.Namespace, produced: list[Path]) -> 
 
 def _parallel(cfg: Config, store: Store, chosen, a, record,
               produced: list[Path] | None = None,
-              labels: dict[str, str | None] | None = None) -> None:
+              labels: dict[str, str | None] | None = None,
+              claims: _Claims | None = None) -> None:
     """Run N posts at once, each owning one live progress row.
 
-    Store writes are serialised: sqlite3 connections are not thread-safe.
+    Store access is serialised on the name registry's lock: sqlite3 connections
+    are not thread-safe, and the registry reads the store from yt-dlp's threads.
     """
     slots = min(cfg.concurrency, len(chosen))
     free: queue.Queue[int] = queue.Queue()
     for i in range(slots):
         free.put(i)
-    store_lock = threading.Lock()
+    claims = claims or _Claims(store)
+    store_lock = claims.lock
 
     with MultilineProgress(slots) as ui:
         def work(n: int, pid: str) -> Outcome:
@@ -649,7 +702,7 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
                 if cfg.agent:
                     hooks.append(ev().hook(n, pid))
                 res = ytdlp_runner.download(
-                    post_url(pid), cfg, simulate=a.dry_run, hooks=hooks,
+                    post_url(pid), cfg, simulate=a.dry_run, hooks=hooks, claim=claims,
                 )
                 with store_lock:
                     _persist(store, res, pid, post_url(pid), a.dry_run)
@@ -661,12 +714,13 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
                     if (res.filepath and res.filepath.exists()) else None,
                     detail=res.detail,
                 )
-                if res.outcome == Outcome.COMPLETE and res.filepath:
-                    if produced is not None and res.filepath.exists():
-                        with store_lock:
-                            produced.append(res.filepath)
-                    mb = res.filepath.stat().st_size / (1024 * 1024)
-                    ui.log(f"  ok  [{n}] {res.filepath.name}  ({mb:.1f} MiB)")
+                if res.outcome == Outcome.COMPLETE and res.videos:
+                    for v in res.videos:
+                        if produced is not None:
+                            with store_lock:
+                                produced.append(v.filepath)
+                        mb = v.filepath.stat().st_size / (1024 * 1024)
+                        ui.log(f"  ok  [{n}] {v.filepath.name}  ({mb:.1f} MiB)")
                 elif a.dry_run:
                     ui.log(f"  would download  [{n}] {res.title or pid}")
                 else:

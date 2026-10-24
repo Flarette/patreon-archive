@@ -169,6 +169,31 @@ class Store:
         )
         self.db.commit()
 
+    def output_owner(self, path: str) -> str | None:
+        """The video recorded as having completed `path`, if any.
+
+        Rows from before media ids were stored carry none; their post id is the
+        owner. Should several rows claim one file, the first to record it wins:
+        its download is the one whose content is on disk.
+        """
+        cur = self.db.execute(
+            """SELECT COALESCE(media_id, post_id) AS owner FROM post_media
+               WHERE output_path = ? AND state = 'complete' ORDER BY rowid LIMIT 1""",
+            (path,),
+        )
+        row = cur.fetchone()
+        return row["owner"] if row else None
+
+    def prune_media(self, post_id: str, keep_keys: set[str]) -> None:
+        """Drop the post's media rows whose dedup_key is not in `keep_keys`."""
+        keep = sorted(keep_keys)
+        self.db.execute(
+            "DELETE FROM post_media WHERE post_id = ? "
+            f"AND dedup_key NOT IN ({','.join('?' * len(keep))})",
+            (post_id, *keep),
+        )
+        self.db.commit()
+
     def duplicate_of(self, content_sha256: str) -> str | None:
         cur = self.db.execute(
             "SELECT first_path FROM blob WHERE content_sha256 = ?", (content_sha256,)

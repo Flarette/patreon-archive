@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 import yt_dlp
+from yt_dlp.postprocessor import PostProcessor
 from yt_dlp.utils import DownloadError, ExtractorError
 
 from ..config import Config
@@ -18,15 +21,33 @@ _NO_ACCESS = re.compile(r"do not have access", re.I)
 _NO_MEDIA = re.compile(r"no supported media found", re.I)
 
 
+# The template field that carries " [<id>]" when a title-only name is taken.
+SUFFIX_FIELD = "%(pa_suffix|)s"
+
+
+class Video(NamedTuple):
+    """One file of a post. `video_id` is yt-dlp's entry id: `<pid>` or `<pid>-<n>`."""
+    video_id: str
+    outcome: Outcome
+    filepath: Path | None
+    detail: str | None = None
+
+
 @dataclass
 class Result:
     outcome: Outcome
     detail: str | None = None
-    filepath: Path | None = None
     title: str | None = None
+    # Always the post's own id, never a multi-video entry id.
     post_id: str | None = None
     uploader: str | None = None
     duplicate_of: Path | None = None
+    videos: list[Video] = field(default_factory=list)
+
+    @property
+    def filepath(self) -> Path | None:
+        """The first video's file, for reports that carry one path per post."""
+        return self.videos[0].filepath if self.videos else None
 
 
 _DEFAULT_OPTS: dict | None = None
@@ -104,6 +125,43 @@ def build_params(cfg: Config, hooks: list | None = None) -> dict:
     return params
 
 
+class _ClaimName(PostProcessor):
+    """Gives a video its title-only name, or appends " [<id>]" when that is taken.
+
+    Runs at the `video` stage, which yt-dlp calls before it computes the filename,
+    so the field set here is in the name the download is written under.
+    """
+
+    def __init__(self, claim: Callable[[str, str], bool]):
+        super().__init__()
+        self._claim = claim
+
+    def run(self, info):
+        # pa_suffix is still unset, so this renders the title-only path.
+        path = self._downloader.prepare_filename(info)
+        if path and not self._claim(str(info["id"]), path):
+            info["pa_suffix"] = f" [{info['id']}]"
+        return [], info
+
+
+class _Finished(PostProcessor):
+    """Notes each video once it sits at its final path.
+
+    A multi-video post can fail on a later video after earlier ones are in place.
+    Those still have to be recorded: unrecorded, a re-run would read their names
+    as taken by a stranger and download them again under a suffix.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.paths: dict[str, Path] = {}
+
+    def run(self, info):
+        if info.get("filepath"):
+            self.paths.setdefault(str(info["id"]), Path(info["filepath"]))
+        return [], info
+
+
 def _final_path(info: dict) -> Path | None:
     reqs = info.get("requested_downloads") or []
     for r in reqs:
@@ -111,6 +169,21 @@ def _final_path(info: dict) -> Path | None:
         if p:
             return Path(p)
     return None
+
+
+def _judge(video_id: str, path: Path | None) -> Video:
+    """Completion rule: a file on disk is never proof on its own. Require a real,
+    non-empty, non-manifest output -- a leftover .m3u8 is not a finished download.
+    """
+    if path is None or not path.exists():
+        return Video(video_id, Outcome.INDETERMINATE, path,
+                     "extraction reported success but no output file was produced")
+    if path.suffix.lower() == ".m3u8":
+        return Video(video_id, Outcome.FAILED, path,
+                     f"output is a bare manifest, not muxed media: {path.name}")
+    if path.stat().st_size == 0:
+        return Video(video_id, Outcome.FAILED, path, "output file is empty")
+    return Video(video_id, Outcome.COMPLETE, path)
 
 
 def classify_error(exc: Exception) -> Result:
@@ -125,7 +198,11 @@ def classify_error(exc: Exception) -> Result:
     return Result(Outcome.FAILED, detail=msg)
 
 
-def download(url: str, cfg: Config, *, simulate: bool = False, hooks: list | None = None) -> Result:
+def download(url: str, cfg: Config, *, simulate: bool = False, hooks: list | None = None,
+             claim: Callable[[str, str], bool] | None = None) -> Result:
+    """Download one post. `claim(video_id, path)` says whether the video may take
+    the title-only `path`; when it may not, the name gets " [<id>]".
+    """
     params = build_params(cfg, hooks)
     if simulate:
         params["simulate"] = True
@@ -133,50 +210,52 @@ def download(url: str, cfg: Config, *, simulate: bool = False, hooks: list | Non
         params["writeinfojson"] = False
         params["writethumbnail"] = False
         params["writesubtitles"] = False
+    finished = _Finished()
     try:
         with yt_dlp.YoutubeDL(params) as ydl:
+            ydl.add_post_processor(finished, when="after_move")
+            # Only the default template carries the field; --keep-id and a user
+            # template are left alone. Dry runs write nothing, so never claim.
+            if claim and not simulate and SUFFIX_FIELD in params["outtmpl"].get("default", ""):
+                ydl.add_post_processor(_ClaimName(claim), when="video")
             info = ydl.extract_info(url, download=not simulate)
     except (DownloadError, ExtractorError) as exc:
-        return classify_error(exc)
+        res = classify_error(exc)
     except Exception as exc:  # noqa: BLE001 - last-resort classification
-        return Result(Outcome.FAILED, detail=f"{type(exc).__name__}: {exc}")
+        res = Result(Outcome.FAILED, detail=f"{type(exc).__name__}: {exc}")
+    else:
+        return _result(info, simulate)
+    # The post keeps the error's outcome, but the videos that finished before it
+    # are still reported, so they get recorded.
+    res.videos = [_judge(vid, path) for vid, path in finished.paths.items()]
+    return res
 
+
+def _result(info: dict | None, simulate: bool) -> Result:
     if info is None:
         return Result(Outcome.INDETERMINATE, detail="extractor returned no info")
 
-    base = dict(info)
-    if base.get("_type") == "playlist":
-        entries = [e for e in (base.get("entries") or []) if e]
-        if not entries:
-            return Result(Outcome.INDETERMINATE, detail="playlist with no entries")
-        base = entries[0]
+    multi = info.get("_type") == "playlist"
+    entries = [e for e in (info.get("entries") or []) if e] if multi else [info]
+    if not entries:
+        return Result(Outcome.INDETERMINATE, detail="playlist with no entries")
 
-    path = None if simulate else _final_path(base)
     meta = Result(
-        Outcome.COMPLETE if simulate else Outcome.FAILED,
-        filepath=path,
-        title=base.get("title"),
-        post_id=str(base.get("id") or ""),
-        uploader=base.get("channel") or base.get("uploader"),
+        Outcome.COMPLETE,
+        title=info.get("title") or entries[0].get("title"),
+        post_id=str(info.get("id") or ""),
+        uploader=(info.get("channel") or info.get("uploader")
+                  or entries[0].get("channel") or entries[0].get("uploader")),
     )
     if simulate:
         meta.detail = "simulated"
         return meta
 
-    # Completion rule: a file on disk is never proof. Require a real, non-manifest
-    # output -- a leftover .m3u8 is not a finished download.
-    if path is None or not path.exists():
-        meta.outcome = Outcome.INDETERMINATE
-        meta.detail = "extraction reported success but no output file was produced"
-        return meta
-    if path.suffix.lower() == ".m3u8":
-        meta.outcome = Outcome.FAILED
-        meta.detail = f"output is a bare manifest, not muxed media: {path.name}"
-        return meta
-    if path.stat().st_size == 0:
-        meta.outcome = Outcome.FAILED
-        meta.detail = "output file is empty"
-        return meta
-
-    meta.outcome = Outcome.COMPLETE
+    meta.videos = [_judge(str(e.get("id") or ""), _final_path(e)) for e in entries]
+    # Complete only when every video is (D3); otherwise the worst of them.
+    bad = [v for v in meta.videos if v.outcome != Outcome.COMPLETE]
+    if bad:
+        worst = next((v for v in bad if v.outcome == Outcome.FAILED), bad[0])
+        meta.outcome = worst.outcome
+        meta.detail = f"{worst.video_id}: {worst.detail}" if multi else worst.detail
     return meta

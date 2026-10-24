@@ -5,11 +5,12 @@ from pathlib import Path
 
 # No date prefix and no [%(id)s] suffix by default -- readable names. The upload
 # date lives in the file's own metadata tags (see `embed_metadata`) and in `-l`.
-# `--keep-id` restores the id, which is worth doing for a bulk archive: two posts
-# can share a title, and without the id the second silently overwrites the first.
+# Two videos can share a title, so `pa_suffix` appends " [<id>]" only when the
+# title-only name is already taken; ytdlp_runner sets it, and unset it renders
+# empty. `--keep-id` always carries the id instead.
 # Posts that belong to a collection drop CREATOR_DIR and sit flat in its folder.
 CREATOR_DIR = "%(channel,uploader,extractor)s/"
-DEFAULT_OUTTMPL = CREATOR_DIR + "%(title).150B.%(ext)s"
+DEFAULT_OUTTMPL = CREATOR_DIR + "%(title).150B%(pa_suffix|)s.%(ext)s"
 OUTTMPL_WITH_ID = CREATOR_DIR + "%(title).150B [%(id)s].%(ext)s"
 
 
