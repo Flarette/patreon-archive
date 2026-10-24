@@ -8,6 +8,7 @@ import datetime
 import os
 import queue
 import re
+import signal
 import sys
 import threading
 from collections.abc import Callable
@@ -314,9 +315,10 @@ tail stdout.
   run_done             summary{outcome: count}, selected, exit_code
 
 index is the entry's number as --list prints it (1 = oldest), present for
-collection entries. For a single post, progress and post_downloaded carry
-index 0 and the other post_* events have none. A dry run emits post_done for a
-post it cannot resolve, as a real run would, and post_would_download otherwise.
+collection entries. For a single post, progress, post_downloaded and
+post_error carry index 0, and the other post_* events have none. A dry run
+emits post_done for a post it cannot resolve, as a real run would, and
+post_would_download otherwise.
 
 Exit codes: 0 complete, 1 failed, 2 no_access, 3 indeterminate, 4 preflight error, 130 interrupted.
 
@@ -558,6 +560,34 @@ def cmd_get(cfg: Config, a: argparse.Namespace) -> int:
         return _EXIT[outcome]
 
 
+@contextlib.contextmanager
+def _sigint_watch():
+    """Yield an Event that any Ctrl-C during the block sets.
+
+    yt-dlp keeps a live recording that Ctrl-C stops and returns as if it had
+    finished (downloader/external.py), so the KeyboardInterrupt never reaches
+    us; the flag still does. The previous handler runs after it, so Ctrl-C
+    raises as before everywhere else. Only the main thread can set a handler,
+    and an ignored SIGINT, as in a job a script puts in the background, stays
+    ignored.
+    """
+    seen = threading.Event()
+    previous = signal.getsignal(signal.SIGINT)
+    if threading.current_thread() is not threading.main_thread() or not callable(previous):
+        yield seen
+        return
+
+    def handler(signum, frame):
+        seen.set()
+        previous(signum, frame)
+
+    signal.signal(signal.SIGINT, handler)
+    try:
+        yield seen
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
     """Collections are unsupported by yt-dlp, so we enumerate them ourselves."""
     with _api(cfg) as api:
@@ -637,9 +667,6 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
               title=label, total=total, selected=len(chosen),
               concurrency=cfg.concurrency, dry_run=a.dry_run,
               post_ids=[pid for _, pid in chosen])
-    _out(f"{label}: {total} posts, selected {len(chosen)}"
-         f"{f', {cfg.concurrency} at a time' if cfg.concurrency > 1 else ''}\n"
-         f"  -> {cfg.archive_root}\n", cfg)
 
     tally: dict[Outcome, int] = {}
     produced: list[Path] = []
@@ -652,27 +679,39 @@ def _collection(cfg: Config, a: argparse.Namespace, collection_id: str) -> int:
         with lock:
             tally[outcome] = tally.get(outcome, 0) + 1
 
+    # From here on every Ctrl-C ends at the summary and run_done below.
     try:
-        if cfg.concurrency > 1:
-            interrupted = _parallel(cfg, store, chosen, a, record, produced, labels, claims)
-        else:
-            for n, pid in chosen:
-                _out(f"[{n}/{total}] {labels.get(pid) or f'post {pid}'}", cfg)
-                try:
-                    outcome = _one_post(cfg, store, post_url(pid), a.dry_run, produced,
-                                        claims, index=n)
-                except KeyboardInterrupt:
-                    print("\ninterrupted", file=sys.stderr)
-                    interrupted = True
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    outcome = Outcome.FAILED
-                    print(f"  failed  [{pid}] {type(exc).__name__}: {exc}", file=sys.stderr)
-                record(outcome)
-                if outcome != Outcome.COMPLETE and not a.continue_on_error:
-                    break
+        with _sigint_watch() as sigint:
+            try:
+                _out(f"{label}: {total} posts, selected {len(chosen)}"
+                     f"{f', {cfg.concurrency} at a time' if cfg.concurrency > 1 else ''}\n"
+                     f"  -> {cfg.archive_root}\n", cfg)
+                if cfg.concurrency > 1:
+                    interrupted = _parallel(cfg, store, chosen, a, record, produced,
+                                            labels, claims, sigint)
+                else:
+                    for n, pid in chosen:
+                        if sigint.is_set():
+                            break
+                        _out(f"[{n}/{total}] {labels.get(pid) or f'post {pid}'}", cfg)
+                        try:
+                            outcome = _one_post(cfg, store, post_url(pid), a.dry_run,
+                                                produced, claims, index=n)
+                        except Exception as exc:  # noqa: BLE001
+                            outcome = Outcome.FAILED
+                            print(f"  failed  [{pid}] {type(exc).__name__}: {exc}",
+                                  file=sys.stderr)
+                        record(outcome)
+                        if outcome != Outcome.COMPLETE and not a.continue_on_error:
+                            break
+            except KeyboardInterrupt:
+                interrupted = True
+            # The flag also catches the Ctrl-C that yt-dlp swallowed.
+            interrupted = interrupted or sigint.is_set()
     finally:
         store.close()
+    if interrupted:
+        print("\ninterrupted", file=sys.stderr)
 
     # D7. no_access decides the code only when nothing completed: a selection
     # that mixes in a few locked posts still did its job.
@@ -721,51 +760,64 @@ def _maybe_archive(cfg: Config, a: argparse.Namespace, produced: list[Path]) -> 
 def _parallel(cfg: Config, store: Store, chosen, a, record,
               produced: list[Path] | None = None,
               labels: dict[str, str | None] | None = None,
-              claims: _Claims | None = None) -> bool:
+              claims: _Claims | None = None,
+              sigint: threading.Event | None = None) -> bool:
     """Run N posts at once, each owning one live progress row.
 
     Every worker shares one name registry, whose lock `_one_post` holds for
     store access: sqlite3 connections are not thread-safe, and the registry
-    reads the store from yt-dlp's threads. Returns whether Ctrl-C cut the run
-    short; posts in flight then finish first, and queued ones are cancelled.
+    reads the store from yt-dlp's threads. Returns whether Ctrl-C, or a set
+    `sigint`, cut the run short; posts in flight then finish first, and queued
+    ones are cancelled.
     """
     slots = min(cfg.concurrency, len(chosen))
     free: queue.Queue[int] = queue.Queue()
     for i in range(slots):
         free.put(i)
     claims = claims or _Claims(store)
+    sigint = sigint or threading.Event()
 
     with MultilineProgress(slots) as ui:
         def log(msg: str, err: bool = False) -> None:
             ui.log(msg)  # already stderr, with the rows
 
-        def work(n: int, pid: str) -> Outcome:
+        def work(n: int, pid: str) -> None:
+            # Each worker counts its own post, so one that finishes while an
+            # interrupt drains the pool still reaches the summary.
             slot = free.get()
             label = f"[{n}] {(labels or {}).get(pid) or pid}"
             try:
                 ui.set(slot, f"  {label:38.38} starting…")
-                return _one_post(cfg, store, post_url(pid), a.dry_run, produced, claims,
-                                 index=n, hooks=[ui.hook(slot, label)], log=log)
+                outcome = _one_post(cfg, store, post_url(pid), a.dry_run, produced, claims,
+                                    index=n, hooks=[ui.hook(slot, label)], log=log)
+            except Exception as exc:  # noqa: BLE001
+                outcome = Outcome.FAILED
+                ui.log(f"  failed  [{n}] {type(exc).__name__}: {exc}")
             finally:
                 ui.set(slot, "")
                 free.put(slot)
+            record(outcome)
 
         with cf.ThreadPoolExecutor(max_workers=slots) as pool:
-            futures = {pool.submit(work, n, pid): (n, pid) for n, pid in chosen}
+            # Submitting is inside the try too: a worker can start, and Ctrl-C
+            # land, before the last submit returns.
+            futures: list[cf.Future] = []
+            interrupted = False
             try:
+                for n, pid in chosen:
+                    futures.append(pool.submit(work, n, pid))
                 for fut in cf.as_completed(futures):
-                    n, pid = futures[fut]
-                    try:
-                        record(fut.result())
-                    except Exception as exc:  # noqa: BLE001
-                        record(Outcome.FAILED)
-                        ui.log(f"  failed  [{n}] {type(exc).__name__}: {exc}")
+                    fut.result()  # re-raises a worker's KeyboardInterrupt
+                    if sigint.is_set():
+                        interrupted = True
+                        break
             except KeyboardInterrupt:
+                interrupted = True
+            if interrupted:
                 # Let in-flight muxes finish rather than corrupting outputs.
                 ui.log("interrupted; letting in-flight downloads finish…")
                 pool.shutdown(wait=True, cancel_futures=True)
-                return True
-    return False
+    return interrupted
 
 
 def cmd_status(cfg: Config, post: str | None) -> int:

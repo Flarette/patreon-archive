@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
+import threading
+import time
 
 import pytest
 from yt_dlp.utils import DownloadError
@@ -21,6 +25,16 @@ def broken(ydl, info, download):
 
 def interrupt(ydl, info, download):
     raise KeyboardInterrupt
+
+
+def swallowed(ydl, info, download):
+    """Ctrl-C while recording a live stream: yt-dlp keeps what it has and goes on."""
+    try:
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(1)  # the handler raises well before this ends
+    except KeyboardInterrupt:
+        pass
+    return ydl.process_ie_result(info, download=download)
 
 
 @pytest.mark.parametrize(("locked", "fails", "jobs", "rc"), [
@@ -89,3 +103,58 @@ def test_interrupted_single_post_exits_130(patreon):
     r = patreon.run(post_url("7004"))
 
     assert r.rc == 130, r
+
+
+def test_ctrl_c_that_ytdlp_swallows_still_stops_the_run(patreon):
+    patreon.collection("44", "Run", ENTRIES)
+    patreon.on_extract["7002"] = swallowed
+
+    r = patreon.run(COLL, "-a", "zip")
+
+    assert r.rc == 130, r
+    assert patreon.extract_calls == ["7001", "7002"]
+    # The interrupted post keeps the outcome yt-dlp reported.
+    assert "\nsummary\n  complete         2\n" in r.out
+    assert r.files == ["Run/One.mp4", "Run/Two.mp4"]
+
+
+@pytest.fixture
+def sigint_seen():
+    """An Event set by a SIGINT handler that then raises as Python's does.
+
+    The run's own handler chains to this one, so a worker can wait until the
+    main thread is handling the Ctrl-C.
+    """
+    seen = threading.Event()
+
+    def handler(signum, frame):
+        seen.set()
+        signal.default_int_handler(signum, frame)
+
+    previous = signal.signal(signal.SIGINT, handler)
+    yield seen
+    signal.signal(signal.SIGINT, previous)
+
+
+def test_posts_that_finish_after_ctrl_c_are_counted(patreon, sigint_seen):
+    patreon.collection("44", "Run", ENTRIES[:2])
+
+    def late(ydl, info, download):
+        # Finishes only once the main thread is handling the Ctrl-C.
+        assert sigint_seen.wait(10)
+        return ydl.process_ie_result(info, download=download)
+
+    def stop(ydl, info, download):
+        os.kill(os.getpid(), signal.SIGINT)
+        return ydl.process_ie_result(info, download=download)
+
+    patreon.on_extract["7001"] = late
+    patreon.on_extract["7002"] = stop
+
+    r = patreon.run(COLL, "-j", "2", "-a", "zip", "--agent")
+
+    assert r.rc == 130, r
+    events = [json.loads(line) for line in r.out.splitlines()]
+    assert [(e["summary"], e["exit_code"]) for e in events
+            if e["event"] == "run_done"] == [({"complete": 2}, 130)]
+    assert r.files == ["Run/One.mp4", "Run/Two.mp4"]
