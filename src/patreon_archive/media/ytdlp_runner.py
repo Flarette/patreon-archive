@@ -27,7 +27,11 @@ SUFFIX_FIELD = "%(pa_suffix|)s"
 
 
 class Video(NamedTuple):
-    """One file of a post. `video_id` is yt-dlp's entry id: `<pid>` or `<pid>-<n>`."""
+    """One file of a post.
+
+    `video_id` is yt-dlp's entry id: `<pid>-<n>` in a multi-video post, else the
+    post's id, or the provider's for an embed.
+    """
     video_id: str
     outcome: Outcome
     filepath: Path | None

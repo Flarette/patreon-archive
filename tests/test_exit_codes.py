@@ -164,13 +164,18 @@ def test_posts_that_finish_after_ctrl_c_are_counted(patreon, sigint_seen):
     assert r.files == ["Run/One.mp4", "Run/Two.mp4"]
 
 
-def test_ctrl_c_before_the_last_submit_cancels_the_queued_posts(patreon, sigint_seen,
-                                                                monkeypatch):
-    """Ctrl-C lands while the third post sits queued and the fourth is unsubmitted."""
+def test_ctrl_c_before_the_last_submit_cancels_the_queued_posts(patreon, monkeypatch):
+    """Ctrl-C lands while the third post sits queued and the fourth is unsubmitted.
+
+    The running posts are held until the pool's shutdown has run, so whether the
+    queued post was cancelled does not depend on timing.
+    """
     patreon.collection("44", "Run", ENTRIES + [("7004", "Four")])
     queued = threading.Event()
+    shut = threading.Event()
     submitted: list[cf.Future] = []
     submit = cf.ThreadPoolExecutor.submit
+    shutdown = cf.ThreadPoolExecutor.shutdown
 
     def submit_then_wait(self, fn, /, *args, **kwargs):
         future = submit(self, fn, *args, **kwargs)
@@ -180,17 +185,23 @@ def test_ctrl_c_before_the_last_submit_cancels_the_queued_posts(patreon, sigint_
             time.sleep(10)  # the handler raises well before this ends
         return future
 
+    def shutdown_then_release(self, wait=True, *, cancel_futures=False):
+        shutdown(self, wait=False, cancel_futures=cancel_futures)
+        shut.set()
+        shutdown(self, wait=wait, cancel_futures=cancel_futures)
+
     def first(ydl, info, download):
         assert queued.wait(10)
         signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
-        assert sigint_seen.wait(10)
+        assert shut.wait(10)
         return ydl.process_ie_result(info, download=download)
 
     def second(ydl, info, download):
-        assert sigint_seen.wait(10)
+        assert shut.wait(10)
         return ydl.process_ie_result(info, download=download)
 
     monkeypatch.setattr(cf.ThreadPoolExecutor, "submit", submit_then_wait)
+    monkeypatch.setattr(cf.ThreadPoolExecutor, "shutdown", shutdown_then_release)
     patreon.on_extract["7001"] = first
     patreon.on_extract["7002"] = second
 

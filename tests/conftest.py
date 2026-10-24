@@ -148,8 +148,9 @@ class FakePatreon:
     """Registered posts and collections, served to the CLI with no network.
 
     `on_extract` maps a pid to `fn(ydl, info, download)`, which replaces the
-    default extraction for that pid: mutate `info` and return
-    `ydl.process_ie_result(info, download=download)`, or raise.
+    default extraction for that pid: return what `extract_info` would, usually
+    `ydl.process_ie_result(info, download=download)` after mutating `info`, or
+    raise.
     """
 
     def __init__(self, root: Path, media: dict[str, Path], capsys):
