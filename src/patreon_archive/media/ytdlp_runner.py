@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import NamedTuple
 
@@ -10,6 +10,7 @@ import yt_dlp
 from yt_dlp.postprocessor import PostProcessor
 from yt_dlp.utils import DownloadError, ExtractorError
 
+from ..auth.cookies import private_copy
 from ..config import Config, is_builtin_outtmpl
 from ..errors import Outcome
 
@@ -216,7 +217,17 @@ def download(url: str, cfg: Config, *, simulate: bool = False, hooks: list | Non
              claim: Callable[[str, str], bool] | None = None) -> Result:
     """Download one post. `claim(video_id, path)` says whether the video may take
     the title-only `path`; when it may not, the name gets " [<id>]".
+
+    Every call loads its own copy of the cookies file: yt-dlp writes the jar
+    back when it closes, and under -j the posts would otherwise rewrite one
+    file while another is loading it.
     """
+    with private_copy(cfg.cookie_file) as jar_file:
+        return _download(url, replace(cfg, cookie_file=jar_file), simulate, hooks, claim)
+
+
+def _download(url: str, cfg: Config, simulate: bool, hooks: list | None,
+              claim: Callable[[str, str], bool] | None) -> Result:
     params = build_params(cfg, hooks)
     if simulate:
         params["simulate"] = True

@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -71,6 +72,11 @@ def _hermetic(tmp_path, monkeypatch):
     # Not a TTY, so the full-collection prompt can never block a run.
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     monkeypatch.setattr(events, "_EMITTER", None)
+    # Cookie copies are temp files. gettempdir() caches its answer, so TMPDIR
+    # would not reach it; this keeps them, and any leftovers, in the test's dir.
+    temp = tmp_path / "tempdir"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
 
     def _no_network(self, *args, **kwargs):
         raise OSError("tests must not touch the network")

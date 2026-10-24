@@ -1,4 +1,7 @@
-"""R1: numbers count the whole collection, oldest first, blocked entries included."""
+"""R1: numbers count the whole collection, oldest first, blocked entries included.
+
+D8: a spec that starts with '-' may follow its flag as a separate word.
+"""
 
 from __future__ import annotations
 
@@ -51,6 +54,9 @@ def test_list_event_maps_numbers_to_pids(coll):
 
 @pytest.mark.parametrize(("args", "numbers"), [
     (["-n", "-i=-3-"], [4, 5]),
+    (["-n", "-i", "-3-"], [4, 5]),
+    (["-n", "--items", "-3-"], [4, 5]),
+    (["-n", "-x", "-2-"], [1, 3, 4]),
     (["-n", "-i", "1-3"], [1, 3]),
     (["-n", "--limit", "2", "-y"], [1, 3]),
 ])
@@ -63,8 +69,17 @@ def test_selection_picks_the_listed_pids(coll, args, numbers):
     assert coll.extract_calls == [listed[n] for n in numbers]
 
 
-def test_selecting_only_blocked_entries_exits_no_access(coll):
-    r = coll.run(URL, "-i", "2")
+@pytest.mark.parametrize("args", [["-i", "2"], ["-I", "-1"]])
+def test_selecting_only_blocked_entries_exits_no_access(coll, args):
+    r = coll.run(URL, *args)
 
     assert r.rc == 2, r
+    assert coll.extract_calls == []
+
+
+def test_a_flag_after_items_is_not_taken_as_its_spec(coll):
+    r = coll.run("get", "-i", "-l", URL)
+
+    assert r.rc == 2, r
+    assert "-i/-I/--items: expected one argument" in r.err
     assert coll.extract_calls == []

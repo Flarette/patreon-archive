@@ -525,7 +525,8 @@ def cmd_get(cfg: Config, a: argparse.Namespace) -> int:
 
     m = _COLLECTION_URL.search(a.url)
 
-    # Extract browser cookies once, not once per post.
+    # Extract browser cookies once, not once per post. A cookies file is copied
+    # instead, so nothing this run does writes to the user's file.
     with materialized_jar(cfg.browser_spec, cfg.cookie_file) as jar_file:
         if jar_file and jar_file != cfg.cookie_file:
             cfg = dataclasses.replace(cfg, browser_spec=None, cookie_file=jar_file)
@@ -782,6 +783,11 @@ def _out(msg: str, cfg: Config, *, err: bool = False) -> None:
     print(msg, file=sys.stderr if (err or cfg.agent) else sys.stdout)
 
 
+# Flags whose spec may start with '-', and what such a spec looks like.
+_SPEC_FLAGS = ("-i", "-I", "--items", "-x", "--exclude")
+_DASH_SPEC = re.compile(r"-[\d,-]+")
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     # Everything after a bare '--' belongs to yt-dlp, not us.
@@ -797,7 +803,16 @@ def main(argv: list[str] | None = None) -> int:
     if raw and _looks_like_url(raw[0]):
         raw.insert(0, "get")
 
-    a = build_parser().parse_args(raw)
+    # argparse takes a spec like '-3-' (the last three) for a flag, which leaves
+    # `-i -3-` without its value. Join the two as `-i=-3-` first (D8).
+    joined: list[str] = []
+    for arg in raw:
+        if joined and joined[-1] in _SPEC_FLAGS and _DASH_SPEC.fullmatch(arg):
+            joined[-1] = f"{joined[-1]}={arg}"
+        else:
+            joined.append(arg)
+
+    a = build_parser().parse_args(joined)
     a.ytdlp_args = ytdlp_args
     cfg = _config(a)
     set_emitter(Emitter(cfg.agent))

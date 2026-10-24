@@ -7,6 +7,7 @@ import yt_dlp
 
 from ..config import Config
 from ..errors import PreflightError, SessionDeadError
+from .cookies import private_copy
 
 REQUIRED_COOKIE = "session_id"
 # AlexCSDev's validator treats this as a hard requirement alongside session_id.
@@ -62,14 +63,16 @@ def _jar_names(spec, cookie_file) -> tuple[set[str], int]:
     params = {"quiet": True, "no_warnings": True}
     if spec:
         params["cookiesfrombrowser"] = spec
-    if cookie_file:
-        params["cookiefile"] = cookie_file
-    with yt_dlp.YoutubeDL(params) as ydl:
-        jar = ydl.cookiejar
-        # yt-dlp loads the jar lazily; touching it forces extraction.
-        jar.get_cookies_for_url("https://www.patreon.com/")
-        names = {c.name for c in jar if "patreon.com" in (c.domain or "")}
-        return names, sum(1 for _ in jar)
+    # The copy outlives the YoutubeDL: its close writes the jar back to it.
+    with private_copy(cookie_file) as jar_file:
+        if jar_file:
+            params["cookiefile"] = jar_file
+        with yt_dlp.YoutubeDL(params) as ydl:
+            jar = ydl.cookiejar
+            # yt-dlp loads the jar lazily; touching it forces extraction.
+            jar.get_cookies_for_url("https://www.patreon.com/")
+            names = {c.name for c in jar if "patreon.com" in (c.domain or "")}
+            return names, sum(1 for _ in jar)
 
 
 def check(cfg: Config) -> Preflight:

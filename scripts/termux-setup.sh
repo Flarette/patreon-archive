@@ -34,7 +34,8 @@ say "Installing patreon-archive"
 # curl_cffi is deliberately not installed: it needs a native build that usually
 # fails here, and only the Vimeo fallback uses it. Native Patreon HLS is fine.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WHEEL="$(ls "$HERE"/patreon_archive-*.whl 2>/dev/null | head -1 || true)"
+# Highest version wins when more than one bundle was unpacked here.
+WHEEL="$(ls "$HERE"/patreon_archive-*.whl 2>/dev/null | sort -V | tail -1 || true)"
 if [ -n "$WHEEL" ]; then
     echo "installing bundled wheel: $(basename "$WHEEL")"
     pip install --upgrade "$WHEEL"
