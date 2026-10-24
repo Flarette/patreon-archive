@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,11 +54,12 @@ class Store:
     def path_key(path: str | Path) -> str:
         """The ownership identity of an output path.
 
-        Casefolded on every filesystem: on a case-insensitive one, paths that
-        differ only in case are one file. SQLite's NOCASE and lower() fold ASCII
-        only, so the comparison happens here rather than in SQL.
+        Normalized and casefolded on every filesystem: APFS and Android storage
+        treat paths that differ only in case, or in NFC/NFD form, as one file.
+        SQLite's NOCASE and lower() fold ASCII only, so the comparison happens here
+        rather than in SQL.
         """
-        return str(Path(path)).casefold()
+        return unicodedata.normalize("NFC", str(Path(path))).casefold()
 
     def get_post(self, post_id: str) -> sqlite3.Row | None:
         cur = self.db.execute("SELECT * FROM post WHERE post_id = ?", (post_id,))

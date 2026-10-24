@@ -271,9 +271,11 @@ def test_multi_video_post_with_a_missing_entry_resumes(patreon):
     assert patreon.store().get_post("3003")["outcome"] == Outcome.COMPLETE
 
 
-# Non-ASCII too: SQLite's NOCASE folds ASCII only.
-@pytest.mark.parametrize(("theirs", "mine"), [("Clip", "clip"), ("Été", "été")],
-                         ids=["ascii", "non-ascii"])
+# Non-ASCII too: SQLite's NOCASE folds ASCII only. And one spelling in NFC, the
+# other in NFD: APFS names one file either way.
+@pytest.mark.parametrize(("theirs", "mine"), [("Clip", "clip"), ("Été", "été"),
+                                              ("Été", "Été")],
+                         ids=["ascii", "non-ascii", "nfd"])
 def test_moved_away_file_still_owns_its_case_alias(patreon, theirs, mine):
     patreon.post("1", theirs, media="a")
     patreon.post("2", mine, media="b")
