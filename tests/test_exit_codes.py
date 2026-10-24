@@ -165,13 +165,15 @@ def test_posts_that_finish_after_ctrl_c_are_counted(patreon, sigint_seen):
 
 
 def test_ctrl_c_before_the_last_submit_cancels_the_queued_posts(patreon, monkeypatch):
-    """Ctrl-C lands while the third post sits queued and the fourth is unsubmitted.
+    """Ctrl-C lands once both running posts have started, while the third sits
+    queued and the fourth is unsubmitted.
 
     The running posts are held until the pool's shutdown has run, so whether the
     queued post was cancelled does not depend on timing.
     """
     patreon.collection("44", "Run", ENTRIES + [("7004", "Four")])
     queued = threading.Event()
+    second_started = threading.Event()
     shut = threading.Event()
     submitted: list[cf.Future] = []
     submit = cf.ThreadPoolExecutor.submit
@@ -192,11 +194,13 @@ def test_ctrl_c_before_the_last_submit_cancels_the_queued_posts(patreon, monkeyp
 
     def first(ydl, info, download):
         assert queued.wait(10)
+        assert second_started.wait(10)
         signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
         assert shut.wait(10)
         return ydl.process_ie_result(info, download=download)
 
     def second(ydl, info, download):
+        second_started.set()
         assert shut.wait(10)
         return ydl.process_ie_result(info, download=download)
 

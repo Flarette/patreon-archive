@@ -566,8 +566,7 @@ def _sigint_watch():
         previous(signum, frame)
 
     try:
-        # Inside the try: a Ctrl-C landing right after installation must still
-        # find the previous handler restored.
+        # Installed inside the try, so a Ctrl-C right after still restores it.
         signal.signal(signal.SIGINT, handler)
         yield seen
     finally:
@@ -743,10 +742,7 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
               labels: dict[str, str | None] | None = None,
               claims: _Claims | None = None,
               sigint: threading.Event | None = None) -> bool:
-    """Run N posts at once, each owning one live progress row.
-
-    Returns whether Ctrl-C, or a set `sigint`, cut the run short.
-    """
+    """Run N posts at once, each owning one live progress row."""
     slots = min(cfg.concurrency, len(chosen))
     free: queue.Queue[int] = queue.Queue()
     for i in range(slots):
@@ -759,8 +755,7 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
             ui.log(msg)  # ui.log writes to stderr already, so `err` changes nothing
 
         def work(n: int, pid: str) -> None:
-            # Each worker counts its own post, so one that finishes while an
-            # interrupt drains the pool still reaches the summary.
+            # Each worker records its own outcome, so posts that drain after Ctrl-C count.
             slot = free.get()
             label = f"[{n}] {(labels or {}).get(pid) or pid}"
             try:
@@ -776,8 +771,7 @@ def _parallel(cfg: Config, store: Store, chosen, a, record,
             record(outcome)
 
         with cf.ThreadPoolExecutor(max_workers=slots) as pool:
-            # Submitting is inside the try too: a worker can start, and Ctrl-C
-            # land, before the last submit returns.
+            # Submitted inside the try, so a Ctrl-C mid-submit still cancels the queue.
             futures: list[cf.Future] = []
             interrupted = False
             try:

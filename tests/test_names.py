@@ -192,24 +192,37 @@ def test_legacy_row_keeps_its_name_and_is_replaced(patreon, media):
     assert [(m["media_id"], m["dedup_key"]) for m in rows] == [("601", "601")]
 
 
-def test_legacy_rows_sharing_a_file_leave_it_to_the_first(patreon, media):
+@pytest.fixture
+def legacy_pair(patreon, media) -> Path:
     """Before 0.4, a second same-title post found the name on disk and recorded it
     as its own. The file holds the first post's download, so the first row owns it.
+    The ids run opposite to the recording order.
     """
     (patreon.out / "Creator").mkdir(parents=True)
     path = patreon.out / "Creator/Live.mp4"
     shutil.copyfile(media["a"], path)
-    patreon.post("2201", "Live", media="a")
-    patreon.post("2202", "Live", media="b")
+    patreon.post("2202", "Live", media="a")
+    patreon.post("2201", "Live", media="b")
     store = patreon.store()
-    legacy_row(store, "2201", "Live", path)
     legacy_row(store, "2202", "Live", path)
+    legacy_row(store, "2201", "Live", path)
+    return path
 
+
+def test_first_recorded_legacy_owner_keeps_the_shared_name(patreon, legacy_pair):
     r = patreon.run(post_url("2202"), "--force")
 
     assert r.rc == 0, r
-    assert r.files == ["Creator/Live [2202].mp4", "Creator/Live.mp4"]
-    assert path.read_bytes() == media["a"].read_bytes()
+    assert r.files == ["Creator/Live.mp4"]
+    assert media_rows(patreon, "2202") == [("2202", "Creator/Live.mp4")]
+
+
+def test_second_recorded_legacy_owner_gets_its_own_file(patreon, media, legacy_pair):
+    r = patreon.run(post_url("2201"), "--force")
+
+    assert r.rc == 0, r
+    assert r.files == ["Creator/Live [2201].mp4", "Creator/Live.mp4"]
+    assert legacy_pair.read_bytes() == media["a"].read_bytes()
 
 
 def test_long_creator_and_title_keep_the_suffix(patreon):
