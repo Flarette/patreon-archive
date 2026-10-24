@@ -69,11 +69,13 @@ def test_selection_picks_the_listed_pids(coll, args, numbers):
     assert coll.extract_calls == [listed[n] for n in numbers]
 
 
-@pytest.mark.parametrize("args", [["-i", "2"], ["-I", "-1"]])
-def test_selecting_only_blocked_entries_exits_no_access(coll, args):
+@pytest.mark.parametrize(("args", "number"), [(["-i", "2"], 2), (["-I", "-1"], 6)])
+def test_selecting_only_blocked_entries_exits_no_access(coll, args, number):
     r = coll.run(URL, *args)
 
+    # argparse also exits 2, so the skip line is what shows the spec was read.
     assert r.rc == 2, r
+    assert f"skipping 1 of 1 selected: no access to {number}" in r.out
     assert coll.extract_calls == []
 
 
