@@ -1,11 +1,15 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "patreon-archive"
 version = "0.4.1"
 description = "Download video from Patreon posts you are entitled to view."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Yan Kotliarov" }]
 requires-python = ">=3.12"
 dependencies = [
     "yt-dlp==2026.7.4",
@@ -21,6 +25,9 @@ dependencies = [
 vimeo = ["curl_cffi==0.16.0"]
 # The test suite also needs ffmpeg and ffprobe on PATH.
 dev = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/Flarette/patreon-archive"
 
 [project.scripts]
 pa = "patreon_archive.cli:main"

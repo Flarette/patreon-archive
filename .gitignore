@@ -1,12 +1,10 @@
-# Phase-1 research clones (depth-1, third-party, ~37MB, each with its own .git)
-research/*/
-
-# Keep the findings docs, which are ours
-!research/*.md
-
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+build/
+dist/
+.DS_Store
 
 # Default download destination; never an input to the build
 downloads/
