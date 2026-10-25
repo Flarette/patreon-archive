@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from yt_dlp.cookies import YoutubeDLCookieJar
 
+from patreon_archive import cli
 from patreon_archive.auth.cookies import private_copy
 
 COLL = "https://www.patreon.com/collection/88"
@@ -85,6 +87,33 @@ def test_run_never_writes_a_cookies_file(patreon, jars, jobs, passthrough):
     assert {jar.mode for jar in jars.values()} == {0o600}
     assert {MARKER in jar.names for jar in jars.values()} == {passthrough}
     assert _leftovers() == []
+
+
+def test_export_writes_only_patreon_cookies(tmp_path):
+    # A browser's jar holds every site's logins; the export travels to another device.
+    browser = tmp_path / "browser.txt"
+    browser.write_text("# Netscape HTTP Cookie File\n" + "".join(
+        f"{domain}\t{sub}\t/\tTRUE\t4102444800\t{name}\tv\n" for domain, sub, name in [
+            ("#HttpOnly_.patreon.com", "TRUE", "session_id"),
+            (".patreon.com", "TRUE", "patreon_device_id"),
+            (".patreon.com", "TRUE", "__cf_bm"),
+            ("www.patreon.com", "FALSE", "analytics"),
+            (".google.com", "TRUE", "SID"),
+            ("notpatreon.com", "FALSE", "lookalike"),
+        ]))
+    out = tmp_path / "patreon-cookies.txt"
+    out.write_text("stale")
+    os.chmod(out, 0o644)
+
+    rc = cli.main(["cookies", str(out), "--cookies-file", str(browser)])
+
+    assert rc == 0
+    jar = YoutubeDLCookieJar(str(out))
+    jar.load()
+    assert sorted((c.domain, c.name) for c in jar) == [
+        (".patreon.com", "__cf_bm"), (".patreon.com", "patreon_device_id"),
+        (".patreon.com", "session_id"), ("www.patreon.com", "analytics")]
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
 
 
 def test_missing_cookies_file_fails_preflight_and_is_not_created(patreon):

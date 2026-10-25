@@ -21,7 +21,7 @@ from . import __version__
 from .api.client import PatreonApi, post_url
 from .archive import FORMATS as ARCHIVE_FORMATS, make_archive
 from .auth import preflight
-from .auth.cookies import materialized_jar
+from .auth.cookies import export_patreon_jar, materialized_jar
 from .config import CREATOR_DIR, Config, DEFAULT_OUTTMPL, OUTTMPL_WITH_ID, parse_browser_spec
 from .errors import Outcome, PatreonArchiveError
 from .events import Emitter, ev, set_emitter
@@ -252,28 +252,25 @@ def cmd_cookies(cfg: Config, out: Path) -> int:
 
     This is how the tool runs on Android/Termux: browser cookie DBs there live in
     app-private storage and cannot be read without root, so the session has to be
-    exported from a desktop and carried over.
+    exported from a desktop and carried over. Only patreon.com's cookies go in.
     """
     pf = preflight.check(cfg)
     for w in pf.warnings:
         print(f"warning: {w}", file=sys.stderr)
 
+    out = out.expanduser()
     with materialized_jar(pf.browser_spec, cfg.cookie_file) as jar_file:
         if not jar_file:
             raise PatreonArchiveError("nothing to export")
-        data = Path(jar_file).read_bytes()
+        kept, left_out = export_patreon_jar(jar_file, out)
 
-    out = out.expanduser()
-    out.write_bytes(data)
-    out.chmod(0o600)
-
-    kept = sum(1 for line in data.decode("utf-8", "replace").splitlines()
-               if line.strip() and not line.startswith("#"))
-    print(f"wrote {out}  ({kept} cookies, mode 0600)")
-    print("\nThis file is a live credential. Treat it like a password:")
+    print(f"wrote {out}  ({kept} Patreon cookies, mode 0600; "
+          f"left out {left_out} from other sites)")
+    print("\nThis file is a live Patreon login. Treat it like a password:")
     print("  - transfer it privately (scp/USB), not via cloud sync or chat")
     print("  - it stops working when the Patreon session expires; re-export then")
-    print(f"\nOn the tablet:\n  patreon-archive get --cookies-file {out.name} -o ~/storage/movies '<url>'")
+    print("\nOn the tablet, save it as ~/patreon-cookies.txt, where termux-setup.sh")
+    print("points PATREON_ARCHIVE_COOKIES, then run:\n  pa '<url>'")
     return EXIT_OK
 
 

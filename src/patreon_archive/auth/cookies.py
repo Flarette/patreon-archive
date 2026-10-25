@@ -6,9 +6,16 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import yt_dlp
+from yt_dlp.cookies import YoutubeDLCookieJar
 from yt_dlp.utils import expand_path
 
 from ..errors import PreflightError
+
+
+def is_patreon(domain: str | None) -> bool:
+    """patreon.com or one of its subdomains; a lookalike such as notpatreon.com is not."""
+    host = (domain or "").lstrip(".")
+    return host == "patreon.com" or host.endswith(".patreon.com")
 
 
 @contextmanager
@@ -77,3 +84,22 @@ def materialized_jar(browser_spec, cookie_file: str | None):
             jar.get_cookies_for_url("https://www.patreon.com/")
             jar.save(filename=tmp, ignore_discard=True, ignore_expires=True)
         yield tmp
+
+
+def export_patreon_jar(jar_file: str, out: Path) -> tuple[int, int]:
+    """Write patreon.com's cookies from `jar_file` to `out`, mode 0600.
+
+    A browser's jar holds every site's logins, and `out` is carried to another
+    device, so nothing else goes in. Returns (kept, left out).
+    """
+    jar = YoutubeDLCookieJar(jar_file)
+    jar.load()
+    others = [c for c in jar if not is_patreon(c.domain)]
+    for c in others:
+        jar.clear(c.domain, c.path, c.name)
+    # O_CREAT's mode only applies to a new file; fchmod covers one being replaced.
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        jar.save(f)
+    return len(jar), len(others)

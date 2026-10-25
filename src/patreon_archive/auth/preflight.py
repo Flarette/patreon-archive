@@ -7,7 +7,7 @@ import yt_dlp
 
 from ..config import Config
 from ..errors import PreflightError, SessionDeadError
-from .cookies import private_copy
+from .cookies import is_patreon, private_copy
 
 REQUIRED_COOKIE = "session_id"
 # AlexCSDev's validator treats this as a hard requirement alongside session_id.
@@ -71,7 +71,7 @@ def _jar_names(spec, cookie_file) -> tuple[set[str], int]:
             jar = ydl.cookiejar
             # yt-dlp loads the jar lazily; touching it forces extraction.
             jar.get_cookies_for_url("https://www.patreon.com/")
-            names = {c.name for c in jar if "patreon.com" in (c.domain or "")}
+            names = {c.name for c in jar if is_patreon(c.domain)}
             return names, sum(1 for _ in jar)
 
 
