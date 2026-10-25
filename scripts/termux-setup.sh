@@ -4,8 +4,10 @@
 # Install Termux from F-Droid or GitHub -- NOT the Play Store, that build is
 # abandoned and its packages are broken.
 #
-#   curl -fsSL <this file> | bash
-# or copy it over and: bash termux-setup.sh
+# Run it from a clone of the repository, which it installs from:
+#   bash patreon-archive/scripts/termux-setup.sh
+# or from an unzipped release bundle, which installs the wheel beside it:
+#   bash termux-setup.sh
 
 set -euo pipefail
 
