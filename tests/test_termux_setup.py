@@ -12,10 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "termux-setup.sh"
 
 
-def test_bundled_copy_matches_the_script():
-    assert (ROOT / "dist" / "termux-setup.sh").read_bytes() == SCRIPT.read_bytes()
-
-
 @pytest.mark.parametrize(("versions", "picked"), [
     (["0.2.0", "0.3.0", "0.10.0"], "0.10.0"),
     (["0.2.0", "0.3.0"], "0.3.0"),

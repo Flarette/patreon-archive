@@ -228,7 +228,7 @@ def test_second_recorded_legacy_owner_gets_its_own_file(patreon, media, legacy_p
 @pytest.mark.xfail(strict=True, reason=(
     "Best-effort: a pre-0.4 file recorded by two posts is owned by the earliest "
     "row, and re-recording the first owner drops its row behind the other's. "
-    "See docs/DEFERRED.md."))
+    "A known limitation; see the README."))
 def test_rerecorded_first_owner_keeps_the_name_from_the_legacy_row(patreon, media, legacy_pair):
     assert patreon.run(post_url("2202"), "--force").rc == 0
 
