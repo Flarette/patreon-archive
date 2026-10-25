@@ -181,8 +181,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--outtmpl", default=None,
                         help="yt-dlp output template (overrides --keep-id)")
     common.add_argument("--keep-id", action="store_true",
-                        help="append [post_id] to filenames; recommended for bulk runs, "
-                             "since two posts can share a title")
+                        help="append [post_id] to every filename. Without it, names are "
+                             "the title alone and get [post_id] only when already taken")
     common.add_argument("-f", "--format", dest="fmt", default="bestvideo*+bestaudio/best")
     common.add_argument("--ffmpeg-location", default=None)
     common.add_argument("--concurrent-fragments", type=int, default=4,
